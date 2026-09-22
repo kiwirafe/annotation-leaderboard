@@ -2,8 +2,7 @@ name: Update Annotation Leaderboard
 
 on:
   schedule:
-    - cron: '*/5 * * * *'
-      timezone: 'Australia/Sydney'
+    - cron: '5/5 * * * *'
   workflow_dispatch:
 
 permissions:
@@ -39,7 +38,7 @@ jobs:
           ANNOTATION_ADMIN_PASSWORD: ${{ secrets.ANNOTATION_ADMIN_PASSWORD }}
         run: |
           mkdir -p docs/progress_json
-          python3 create_leaderboard.py \
+          python3 update_leaderboard.py \
             --target-clips "$TARGET_CLIPS" \
             --output docs/index.html \
             --progress-json-dir docs/progress_json
