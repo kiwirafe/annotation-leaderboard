@@ -1,0 +1,32 @@
+{
+  "Hanyu": {
+    "actions_annotated": 192,
+    "clips_fully_annotated": 10,
+    "proposals": 118
+  },
+  "Jiayang Wang": {
+    "actions_annotated": 160,
+    "clips_fully_annotated": 10,
+    "proposals": 120
+  },
+  "Khai": {
+    "actions_annotated": 192,
+    "clips_fully_annotated": 10,
+    "proposals": 79
+  },
+  "Naman Kansal": {
+    "actions_annotated": 171,
+    "clips_fully_annotated": 9,
+    "proposals": 56
+  },
+  "Ngakan Putu Bagus Aditya": {
+    "actions_annotated": 160,
+    "clips_fully_annotated": 10,
+    "proposals": 0
+  },
+  "Shantelle So": {
+    "actions_annotated": 154,
+    "clips_fully_annotated": 6,
+    "proposals": 88
+  }
+}
