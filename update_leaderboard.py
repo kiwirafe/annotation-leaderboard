@@ -25,6 +25,7 @@ Counting rules:
   - A clip is fully annotated by a person only when every action in that clip's
     canonical_action_pool has a complete judgment for all five expected horizons:
     H10, H60, H30M, H1H, H3H.
+  - A proposal counts only when it has a non-empty reason and at least one associated fact_id.
   - Known model annotators and explicit exclusions are excluded from all human rankings.
 
 The script can download /api/export using the same .env credentials as the
@@ -94,6 +95,13 @@ AI_NAME_HINTS = (
 )
 
 EXPECTED_HORIZONS = ("H10", "H60", "H30M", "H1H", "H3H")
+HORIZON_LABELS = {
+    "H10": "0–10 seconds",
+    "H60": "10 seconds–1 minute",
+    "H30M": "1–30 minutes",
+    "H1H": "30 minutes–1 hour",
+    "H3H": "1–3 hours",
+}
 PROGRESS_JSON_PREFIX = "annotation_progress"
 
 
@@ -271,6 +279,20 @@ def horizon_judgment_is_complete(judgment: Any) -> bool:
     return False
 
 
+def action_is_started(action: dict[str, Any]) -> bool:
+    """Return True when at least one horizon has an actual yes/no judgment."""
+    judgments = action.get("horizon_judgments") or {}
+    if not isinstance(judgments, dict):
+        return False
+
+    return any(
+        str((judgment or {}).get("action_judgment") or "").strip().casefold()
+        in {"yes", "no"}
+        for judgment in judgments.values()
+        if isinstance(judgment, dict)
+    )
+
+
 def action_is_complete(action: dict[str, Any]) -> bool:
     """Return True when all five expected horizons have complete judgments."""
     judgments = action.get("horizon_judgments") or {}
@@ -306,6 +328,207 @@ def clip_is_fully_annotated(
         for canonical_id in pool_ids
     )
 
+def proposal_is_complete(proposal: dict[str, Any]) -> bool:
+    """Return True only when a proposal has a reason and at least one associated fact."""
+    reason = str(proposal.get("reason") or "").strip()
+    fact_ids = proposal.get("fact_ids")
+
+    return (
+        bool(reason)
+        and isinstance(fact_ids, (list, tuple, set))
+        and any(str(fact_id).strip() for fact_id in fact_ids)
+    )
+
+
+def audit_action_text(item: dict[str, Any]) -> str:
+    for key in (
+        "canonical_action",
+        "action",
+        "action_text",
+        "text",
+        "description",
+        "representative_action",
+        "canonical_text",
+    ):
+        value = item.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return "(action text unavailable)"
+
+
+def audit_canonical_id(item: dict[str, Any]) -> str:
+    value = item.get("canonical_action_id")
+    return str(value).strip() if value is not None else ""
+
+
+def audit_judgment(action: dict[str, Any] | None, horizon: str) -> dict[str, Any] | None:
+    if not isinstance(action, dict):
+        return None
+    judgments = action.get("horizon_judgments")
+    if not isinstance(judgments, dict):
+        return None
+    value = judgments.get(horizon)
+    return value if isinstance(value, dict) else None
+
+
+def audit_judgment_state(judgment: dict[str, Any] | None) -> str:
+    if not isinstance(judgment, dict):
+        return "unset"
+    value = str(judgment.get("action_judgment") or "").strip().casefold()
+    return value if value in {"yes", "no"} else "unset"
+
+
+def audit_missing_required_detail(judgment: dict[str, Any] | None) -> bool:
+    state = audit_judgment_state(judgment)
+
+    if state == "yes":
+        reason = str((judgment or {}).get("reason_judgment") or "").strip().casefold()
+        return not reason or reason == "unset"
+
+    if state == "no":
+        reasons = (judgment or {}).get("rejection_reasons")
+        if not isinstance(reasons, (list, tuple, set)):
+            return True
+        return not any(str(reason).strip() for reason in reasons)
+
+    return False
+
+
+def compress_audit_findings(
+    row_number: int,
+    pool: list[dict[str, Any]],
+    affected: set[tuple[int, str]],
+) -> list[dict[str, Any]]:
+    if not pool or not affected:
+        return []
+
+    all_cells = {
+        (ca_number, horizon)
+        for ca_number in range(1, len(pool) + 1)
+        for horizon in EXPECTED_HORIZONS
+    }
+
+    if affected == all_cells:
+        return [{
+            "row": row_number,
+            "ca": "ALL",
+            "action": "ALL",
+            "band": "ALL",
+        }]
+
+    findings: list[dict[str, Any]] = []
+
+    for ca_number, pool_item in enumerate(pool, start=1):
+        affected_horizons = [
+            horizon
+            for horizon in EXPECTED_HORIZONS
+            if (ca_number, horizon) in affected
+        ]
+        if not affected_horizons:
+            continue
+
+        action = audit_action_text(pool_item)
+
+        if len(affected_horizons) == len(EXPECTED_HORIZONS):
+            findings.append({
+                "row": row_number,
+                "ca": f"CA{ca_number}",
+                "action": action,
+                "band": "ALL",
+            })
+            continue
+
+        for horizon in affected_horizons:
+            findings.append({
+                "row": row_number,
+                "ca": f"CA{ca_number}",
+                "action": action,
+                "band": HORIZON_LABELS.get(horizon, horizon),
+            })
+
+    return findings
+
+
+def analyse_missing_details(
+    records: list[dict[str, Any]],
+    *,
+    start_row: int,
+    explicit_ai_names: set[str],
+    excluded_clip_ids: set[str],
+    excluded_annotators: set[str],
+) -> dict[str, Any]:
+    by_person: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+
+    for original_index, record in enumerate(records, start=start_row):
+        row_number = original_index + 1
+        clip_id = normalize_name(record.get("clip_id"))
+
+        if is_excluded(clip_id, excluded_clip_ids):
+            continue
+
+        pool_raw = record.get("canonical_action_pool") or []
+        pool = [
+            item for item in pool_raw if isinstance(item, dict)
+        ] if isinstance(pool_raw, list) else []
+
+        if not pool:
+            continue
+
+        for annotation in record.get("annotations") or []:
+            if not isinstance(annotation, dict):
+                continue
+
+            name = normalize_name(annotation.get("annotator_id"))
+
+            if is_excluded(name, excluded_annotators):
+                continue
+            if is_ai_annotator(name, explicit_ai_names):
+                continue
+
+            actions = annotation.get("canonical_actions") or []
+            action_map = {
+                audit_canonical_id(action): action
+                for action in actions
+                if isinstance(action, dict) and audit_canonical_id(action)
+            } if isinstance(actions, list) else {}
+
+            affected: set[tuple[int, str]] = set()
+
+            for ca_number, pool_item in enumerate(pool, start=1):
+                cid = audit_canonical_id(pool_item)
+                action = action_map.get(cid) if cid else None
+
+                for horizon in EXPECTED_HORIZONS:
+                    judgment = audit_judgment(action, horizon)
+                    state = audit_judgment_state(judgment)
+
+                    if state in {"yes", "no"} and audit_missing_required_detail(judgment):
+                        affected.add((ca_number, horizon))
+
+            by_person[name].extend(
+                compress_audit_findings(
+                    row_number=row_number,
+                    pool=pool,
+                    affected=affected,
+                )
+            )
+
+    issue_people = {
+        name: findings
+        for name, findings in sorted(
+            by_person.items(),
+            key=lambda item: item[0].casefold(),
+        )
+        if findings
+    }
+
+    return {
+        "by_person": issue_people,
+        "total_findings": sum(len(findings) for findings in issue_people.values()),
+        "people_affected": len(issue_people),
+    }
+
+
 def rank_counts(
     counts: collections.Counter[str] | dict[str, int],
     *,
@@ -339,6 +562,7 @@ def analyse(
     excluded_annotators: set[str],
 ) -> dict[str, Any]:
     annotation_counts: collections.Counter[str] = collections.Counter()
+    started_action_counts: collections.Counter[str] = collections.Counter()
     proposal_counts: collections.Counter[str] = collections.Counter()
     full_clip_sets: dict[str, set[str]] = collections.defaultdict(set)
 
@@ -366,7 +590,8 @@ def analyse(
                 ai_names.add(name)
                 continue
             human_names.add(name)
-            proposal_counts[name] += 1
+            if proposal_is_complete(proposal):
+                proposal_counts[name] += 1
 
         for annotation in record.get("annotations") or []:
             if not isinstance(annotation, dict):
@@ -382,7 +607,11 @@ def analyse(
             actions = annotation.get("canonical_actions") or []
             if isinstance(actions, list):
                 for action in actions:
-                    if isinstance(action, dict) and action_is_complete(action):
+                    if not isinstance(action, dict):
+                        continue
+                    if action_is_started(action):
+                        started_action_counts[name] += 1
+                    if action_is_complete(action):
                         annotation_counts[name] += 1
 
             if clip_is_fully_annotated(canonical_pool, annotation):
@@ -394,6 +623,7 @@ def analyse(
 
     return {
         "annotation_counts": dict(annotation_counts),
+        "started_action_counts": dict(started_action_counts),
         "proposal_counts": dict(proposal_counts),
         "full_clip_counts": dict(full_clip_counts),
         "annotation_ranking": rank_counts(annotation_counts, include_zero_names=human_names),
@@ -507,11 +737,12 @@ def find_day_baseline(
     return None
 
 
-def action_counts_from_progress_json(
+def counts_from_progress_json(
     payload: dict[str, dict[str, int]],
+    metric: str,
 ) -> dict[str, int]:
     return {
-        name: int(metrics.get("actions_annotated", 0))
+        name: int(metrics.get(metric, 0))
         for name, metrics in payload.items()
     }
 
@@ -538,81 +769,86 @@ def medal_for_rank(rank: int) -> str:
     return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "")
 
 
-def top_person(rows: list[dict[str, Any]], require_positive: bool = True) -> tuple[str, int] | None:
+def top_person(rows: list[dict[str, Any]]) -> tuple[str, int] | None:
     if not rows:
         return None
     count = int(rows[0]["count"])
-    if require_positive and count <= 0:
+    if count <= 0:
         return None
     return str(rows[0]["name"]), count
 
 
-def render_rank_table(rows: list[dict[str, Any]], noun: str) -> str:
-    if not rows:
-        return '<div class="empty">No recorded activity.</div>'
-
-    body = []
-    for row in rows:
-        rank = int(row["rank"])
-        body.append(
-            "<tr>"
-            f'<td class="rank-cell"><span class="rank-number">{rank}</span>'
-            f'<span class="medal">{medal_for_rank(rank)}</span></td>'
-            f'<td><span class="person-name">{esc(row["name"])}</span></td>'
-            f'<td class="count-cell">{fmt_int(row["count"])} '
-            f'<span class="unit">{esc(noun)}</span></td>'
-            "</tr>"
-        )
-
-    return (
-        '<div class="table-wrap"><table class="ranking-table">'
-        '<thead><tr><th>Rank</th><th>Person</th><th>Progress</th></tr></thead>'
-        f'<tbody>{"".join(body)}</tbody></table></div>'
-    )
-
-
-def render_rank_bars(rows: list[dict[str, Any]], limit: int = 12) -> str:
-    rows = rows[:limit]
-    if not rows:
-        return '<div class="empty compact">No recorded activity.</div>'
-
-    max_count = max(int(row["count"]) for row in rows) or 1
-    rendered = []
-    for row in rows:
-        width = 100.0 * int(row["count"]) / max_count
-        rendered.append(
-            '<div class="bar-row">'
-            f'<div class="bar-person" title="{esc(row["name"])}">'
-            f'<span class="bar-medal">{medal_for_rank(int(row["rank"]))}</span>'
-            f'{esc(row["name"])}</div>'
-            '<div class="bar-track">'
-            f'<div class="bar-fill" style="width:{width:.2f}%"></div>'
-            '</div>'
-            f'<div class="bar-count">{fmt_int(row["count"])}</div>'
-            '</div>'
-        )
-    return "".join(rendered)
-
-
-def render_leader_card(
+def render_combined_activity_card(
     title: str,
     subtitle: str,
-    rows: list[dict[str, Any]],
+    total_rows: list[dict[str, Any]],
+    today_rows: list[dict[str, Any]],
     noun: str,
     accent_class: str,
     icon: str,
 ) -> str:
-    top = top_person(rows)
+    today_by_name = {
+        str(row["name"]): int(row["count"])
+        for row in today_rows
+    }
+
+    top = top_person(total_rows)
     if top:
         top_html = (
             '<div class="leader-strip"><span class="leader-crown">👑</span>'
-            f'<span><b>{esc(top[0])}</b> leads with <b>{fmt_int(top[1])}</b> '
-            f'{esc(noun)}.</span></div>'
+            f'<span><b>{esc(top[0])}</b> leads overall with '
+            f'<b>{fmt_int(top[1])}</b> {esc(noun)}.</span></div>'
         )
     else:
         top_html = '<div class="leader-strip muted-strip">No activity recorded yet.</div>'
 
-    return f'''
+    bars = []
+    table_rows = []
+    max_count = max((int(row["count"]) for row in total_rows), default=0) or 1
+
+    for row in total_rows:
+        rank = int(row["rank"])
+        name = str(row["name"])
+        total = int(row["count"])
+        today = int(today_by_name.get(name, 0))
+        width = 100.0 * total / max_count
+
+        bars.append(
+            '<div class="bar-row combined-bar-row">'
+            f'<div class="bar-person" title="{esc(name)}">'
+            f'<span class="bar-medal">{medal_for_rank(rank)}</span>'
+            f'{esc(name)}</div>'
+            '<div class="bar-track">'
+            f'<div class="bar-fill" style="width:{width:.2f}%"></div>'
+            '</div>'
+            f'<div class="bar-count combined-bar-count">'
+            f'<b>{fmt_int(total)}</b>'
+            f'<span class="today-inline">+{fmt_int(today)}</span>'
+            '</div>'
+            '</div>'
+        )
+
+        table_rows.append(
+            '<tr>'
+            f'<td class="rank-cell"><span class="rank-number">{rank}</span>'
+            f'<span class="medal">{medal_for_rank(rank)}</span></td>'
+            f'<td><span class="person-name">{esc(name)}</span></td>'
+            f'<td class="numeric combined-total">{fmt_int(total)}</td>'
+            f'<td class="numeric today-value">+{fmt_int(today)}</td>'
+            '</tr>'
+        )
+
+    table = (
+        '<div class="empty">No recorded activity.</div>'
+        if not table_rows
+        else (
+            '<div class="table-wrap"><table class="combined-table">'
+            '<thead><tr><th>Rank</th><th>Person</th><th>Total</th><th>Today</th></tr></thead>'
+            f'<tbody>{"".join(table_rows)}</tbody></table></div>'
+        )
+    )
+
+    return f"""
     <section class="panel leaderboard-panel {esc(accent_class)}">
       <div class="panel-heading">
         <div class="panel-icon">{icon}</div>
@@ -622,12 +858,109 @@ def render_leader_card(
         </div>
       </div>
       {top_html}
-      <div class="bars">{render_rank_bars(rows)}</div>
+      <div class="bars">{"".join(bars[:12])}</div>
       <h3>Full ranking</h3>
-      {render_rank_table(rows, noun)}
+      {table}
     </section>
-    '''
+    """
 
+
+def render_completion_quality_card(stats: dict[str, Any]) -> str:
+    rows = []
+    for name in stats["human_names"]:
+        started = int(stats["started_action_counts"].get(name, 0))
+        completed = int(stats["annotation_counts"].get(name, 0))
+        rate = (100.0 * completed / started) if started else 0.0
+        rows.append(
+            {
+                "name": name,
+                "started": started,
+                "completed": completed,
+                "rate": rate,
+            }
+        )
+
+    rows.sort(
+        key=lambda row: (
+            -row["rate"],
+            -row["completed"],
+            row["name"].casefold(),
+        )
+    )
+
+    ranked_rows = []
+    previous_rate: float | None = None
+    previous_rank = 0
+    for position, row in enumerate(rows, start=1):
+        if previous_rate is None or abs(row["rate"] - previous_rate) > 1e-9:
+            previous_rank = position
+            previous_rate = row["rate"]
+        ranked_rows.append({**row, "rank": previous_rank})
+
+    if ranked_rows and ranked_rows[0]["started"] > 0:
+        leader = ranked_rows[0]
+        top_html = (
+            '<div class="leader-strip"><span class="leader-crown">✨</span>'
+            f'<span><b>{esc(leader["name"])}</b> has the highest completion quality at '
+            f'<b>{leader["rate"]:.0f}%</b>.</span></div>'
+        )
+    else:
+        top_html = '<div class="leader-strip muted-strip">No started actions recorded yet.</div>'
+
+    bars = []
+    table_rows = []
+
+    for row in ranked_rows:
+        rate = float(row["rate"])
+        bars.append(
+            '<div class="bar-row quality-bar-row">'
+            f'<div class="bar-person" title="{esc(row["name"])}">'
+            f'<span class="bar-medal">{medal_for_rank(int(row["rank"]))}</span>'
+            f'{esc(row["name"])}</div>'
+            '<div class="bar-track">'
+            f'<div class="bar-fill quality-fill" style="width:{min(100.0, rate):.2f}%"></div>'
+            '</div>'
+            f'<div class="bar-count">{rate:.0f}%</div>'
+            '</div>'
+        )
+
+        table_rows.append(
+            '<tr>'
+            f'<td class="rank-cell"><span class="rank-number">{int(row["rank"])}</span>'
+            f'<span class="medal">{medal_for_rank(int(row["rank"]))}</span></td>'
+            f'<td><span class="person-name">{esc(row["name"])}</span></td>'
+            f'<td class="numeric">{fmt_int(row["started"])}</td>'
+            f'<td class="numeric">{fmt_int(row["completed"])}</td>'
+            f'<td class="numeric quality-rate">{rate:.0f}%</td>'
+            '</tr>'
+        )
+
+    table = (
+        '<div class="empty">No contributors detected.</div>'
+        if not table_rows
+        else (
+            '<div class="table-wrap"><table class="quality-table">'
+            '<thead><tr><th>Rank</th><th>Person</th><th>Started</th>'
+            '<th>Completed</th><th>Quality</th></tr></thead>'
+            f'<tbody>{"".join(table_rows)}</tbody></table></div>'
+        )
+    )
+
+    return f"""
+    <section class="panel leaderboard-panel accent-orange">
+      <div class="panel-heading">
+        <div class="panel-icon">✨</div>
+        <div>
+          <h2>Completion quality</h2>
+          <p>Properly completed actions as a percentage of actions each person has started.</p>
+        </div>
+      </div>
+      {top_html}
+      <div class="bars">{"".join(bars[:12])}</div>
+      <h3>Full ranking</h3>
+      {table}
+    </section>
+    """
 
 def render_target_card(
     rows: list[dict[str, Any]],
@@ -651,8 +984,6 @@ def render_target_card(
         count = int(row["count"])
         pct = 100.0 * count / target_clips
         width = min(100.0, pct)
-        remaining = max(0, target_clips - count)
-        status = "✓ target reached" if count >= target_clips else f"{remaining} to go"
         bars.append(
             '<div class="bar-row target-row">'
             f'<div class="bar-person" title="{esc(row["name"])}">'
@@ -672,7 +1003,6 @@ def render_target_card(
             f'<td class="numeric">{fmt_int(count)}</td>'
             f'<td class="numeric">{fmt_int(target_clips)}</td>'
             f'<td class="numeric">{pct:.0f}%</td>'
-            f'<td class="target-status">{esc(status)}</td>'
             '</tr>'
         )
 
@@ -682,7 +1012,7 @@ def render_target_card(
         else (
             '<div class="table-wrap"><table class="target-table">'
             '<thead><tr><th>Rank</th><th>Person</th><th>Full clips</th>'
-            '<th>Target</th><th>Progress</th><th>Status</th></tr></thead>'
+            '<th>Target</th><th>Progress</th></tr></thead>'
             f'<tbody>{"".join(table_rows)}</tbody></table></div>'
         )
     )
@@ -704,9 +1034,70 @@ def render_target_card(
     '''
 
 
+def render_compact_audit(audit: dict[str, Any]) -> str:
+    total_findings = int(audit["total_findings"])
+    people_affected = int(audit["people_affected"])
+
+    if total_findings == 0:
+        body = (
+            '<div class="audit-clear">✓ All completed Yes/No judgments '
+            'include their required details.</div>'
+        )
+    else:
+        people_html = []
+
+        for name, findings in audit["by_person"].items():
+            rows = "".join(
+                '<tr>'
+                f'<td class="audit-row">{fmt_int(finding["row"])}</td>'
+                f'<td class="audit-ca">{esc(finding["ca"])}</td>'
+                f'<td class="audit-action" title="{esc(finding["action"])}">'
+                f'{esc(finding["action"])}</td>'
+                f'<td class="audit-band">{esc(finding["band"])}</td>'
+                '</tr>'
+                for finding in findings
+            )
+
+            people_html.append(
+                '<details class="audit-person" open>'
+                '<summary>'
+                f'<span class="audit-name">{esc(name)}</span>'
+                f'<span class="audit-count">{fmt_int(len(findings))} issue'
+                f'{"s" if len(findings) != 1 else ""}</span>'
+                '</summary>'
+                '<div class="audit-table-wrap">'
+                '<table class="audit-table">'
+                '<thead><tr><th>Row</th><th>CA</th><th>Action</th><th>Time band</th></tr></thead>'
+                f'<tbody>{rows}</tbody>'
+                '</table>'
+                '</div>'
+                '</details>'
+            )
+
+        body = "".join(people_html)
+
+    return f'''
+    <section class="panel compact-audit">
+      <div class="audit-heading">
+        <div>
+          <h2>Incomplete annotation details</h2>
+          <p>Completed Yes/No judgments that still need their required supporting details.</p>
+        </div>
+        <div class="audit-summary">
+          <span><b>{fmt_int(total_findings)}</b> findings</span>
+          <span><b>{fmt_int(people_affected)}</b> people affected</span>
+        </div>
+      </div>
+      {body}
+    </section>
+    '''
+
+
 def render_dashboard(
     stats: dict[str, Any],
     today_ranking: list[dict[str, Any]],
+    proposals_today_ranking: list[dict[str, Any]],
+    audit: dict[str, Any],
     *,
     target_clips: int,
     generated_at_aest: dt.datetime,
@@ -764,31 +1155,27 @@ def render_dashboard(
         for icon, label, value, sub in cards
     )
 
-    annotation_card = render_leader_card(
-        "Most annotations",
-        "Canonical actions with complete judgments in all five time bands. Each canonical action counts once.",
+    annotation_activity_card = render_combined_activity_card(
+        "Annotation progress",
+        "Overall completed canonical actions with today's new annotations shown alongside.",
         stats["annotation_ranking"],
+        today_ranking,
         "annotations",
         "accent-blue",
         "🏆",
     )
-    full_clip_card = render_target_card(stats["full_clip_ranking"], target_clips)
-    today_card = render_leader_card(
-        "Actions annotated today",
-        "Leaderboard of new actions annotated since the start of today",
-        today_ranking,
-        "today",
-        "accent-orange",
-        "📅",
-    )
-    proposal_card = render_leader_card(
-        "Most actions proposed",
-        "Leaderboard of most actions proposed by humans",
+    proposal_activity_card = render_combined_activity_card(
+        "Proposal progress",
+        "Overall valid action proposals with today's new valid proposals shown alongside.",
         stats["proposal_ranking"],
+        proposals_today_ranking,
         "proposals",
         "accent-green",
         "💡",
     )
+    full_clip_card = render_target_card(stats["full_clip_ranking"], target_clips)
+    completion_quality_card = render_completion_quality_card(stats)
+    compact_audit = render_compact_audit(audit)
 
     return f'''<!doctype html>
 <html lang="en">
@@ -846,7 +1233,6 @@ body {{
 }}
 .eyebrow {{ color:#b8c8eb; text-transform:uppercase; letter-spacing:.16em; font-size:11px; font-weight:800; }}
 h1 {{ margin:8px 0 10px; font-size:clamp(32px,5vw,56px); line-height:1.03; letter-spacing:-.045em; }}
-.hero-copy {{ max-width:940px; color:#bcc9e4; font-size:15px; line-height:1.7; }}
 .hero-meta {{ display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:20px; color:#8fa2c7; font-size:12px; }}
 .hero-meta b {{ color:#dce6fb; }}
 .mode-pill {{ display:inline-block; padding:4px 9px; border:1px solid #42567e; border-radius:999px; background:#15233b; color:#dbe7ff; font-weight:800; }}
@@ -866,7 +1252,7 @@ h1 {{ margin:8px 0 10px; font-size:clamp(32px,5vw,56px); line-height:1.03; lette
 .mini-leader span {{ display:block; color:#8ea0c2; text-transform:uppercase; letter-spacing:.07em; font-size:8px; font-weight:850; }}
 .mini-leader b {{ display:block; margin:5px 0 2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; }}
 .mini-leader small {{ color:#aebbd5; font-size:9px; }}
-.leaderboards {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; }}
+.dashboard-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; }}
 .leaderboard-panel {{ min-width:0; }}
 .accent-blue {{ border-top:3px solid var(--blue); }}
 .accent-purple {{ border-top:3px solid var(--purple); }}
@@ -892,23 +1278,54 @@ th {{ color:#95a8cc; background:#151e31; text-transform:uppercase; letter-spacin
 td {{ color:#dce6fb; font-size:11px; }}
 tbody tr:last-child td {{ border-bottom:0; }}
 tbody tr:hover td {{ background:#141d30; }}
-.ranking-table th:nth-child(1),.ranking-table td:nth-child(1) {{ width:72px; }}
-.ranking-table th:nth-child(3),.ranking-table td:nth-child(3) {{ width:150px; text-align:right; }}
 .target-table th:nth-child(1),.target-table td:nth-child(1) {{ width:66px; }}
 .target-table th:nth-child(3),.target-table td:nth-child(3),
 .target-table th:nth-child(4),.target-table td:nth-child(4),
 .target-table th:nth-child(5),.target-table td:nth-child(5) {{ width:86px; text-align:right; }}
-.target-table th:nth-child(6),.target-table td:nth-child(6) {{ width:110px; }}
+.combined-table th:nth-child(1),.combined-table td:nth-child(1) {{ width:72px; }}
+.combined-table th:nth-child(3),.combined-table td:nth-child(3),
+.combined-table th:nth-child(4),.combined-table td:nth-child(4) {{ width:92px; text-align:right; }}
+.combined-total {{ font-size:13px; }}
+.today-value {{ color:#c9f3df; font-weight:850; }}
+.combined-bar-row {{ grid-template-columns:minmax(110px,180px) 1fr 92px; }}
+.combined-bar-count {{ display:flex; justify-content:flex-end; gap:8px; align-items:baseline; }}
+.combined-bar-count b {{ color:#dce6fb; }}
+.today-inline {{ color:#8ee2b8; font-size:9px; }}
+.quality-fill {{ background:linear-gradient(90deg,var(--orange),#ffe1a8); }}
+.quality-table th:nth-child(1),.quality-table td:nth-child(1) {{ width:66px; }}
+.quality-table th:nth-child(3),.quality-table td:nth-child(3),
+.quality-table th:nth-child(4),.quality-table td:nth-child(4),
+.quality-table th:nth-child(5),.quality-table td:nth-child(5) {{ width:88px; text-align:right; }}
+.quality-rate {{ color:#ffe0a4; font-weight:850; }}
+.compact-audit {{ margin-top:18px; padding:20px 22px; }}
+.audit-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:12px; }}
+.audit-heading h2 {{ margin:0; font-size:17px; }}
+.audit-heading p {{ margin:4px 0 0; font-size:11px; line-height:1.5; }}
+.audit-summary {{ display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }}
+.audit-summary span {{ padding:6px 9px; border:1px solid #4b3d62; border-radius:999px; background:rgba(187,145,255,.08); color:#d8c2ff; font-size:10px; white-space:nowrap; }}
+.audit-person {{ border-top:1px solid var(--line); }}
+.audit-person:first-of-type {{ border-top:0; }}
+.audit-person summary {{ cursor:pointer; list-style:none; display:flex; justify-content:space-between; gap:14px; align-items:center; padding:12px 2px; }}
+.audit-person summary::-webkit-details-marker {{ display:none; }}
+.audit-name {{ font-size:12px; font-weight:800; }}
+.audit-count {{ color:#cdb8f2; font-size:10px; }}
+.audit-table-wrap {{ overflow-x:auto; padding:2px 0 12px; }}
+.audit-table {{ table-layout:fixed; min-width:620px; }}
+.audit-table th,.audit-table td {{ padding:9px 10px; }}
+.audit-table th {{ font-size:9px; }}
+.audit-table td {{ font-size:11px; }}
+.audit-table th:nth-child(1),.audit-table td:nth-child(1) {{ width:58px; }}
+.audit-table th:nth-child(2),.audit-table td:nth-child(2) {{ width:64px; }}
+.audit-table th:nth-child(4),.audit-table td:nth-child(4) {{ width:140px; }}
+.audit-row,.audit-ca,.audit-band {{ white-space:nowrap; font-weight:700; }}
+.audit-action {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
+.audit-clear {{ padding:11px 13px; border:1px dashed rgba(103,216,159,.28); border-radius:10px; color:#9be9bf; font-size:11px; }}
 .rank-cell {{ white-space:nowrap; }}
 .rank-number {{ display:inline-block; min-width:22px; font-weight:900; font-variant-numeric:tabular-nums; }}
 .medal {{ display:inline-block; width:22px; }}
 .person-name {{ font-weight:750; }}
-.count-cell {{ font-size:13px; font-weight:850; font-variant-numeric:tabular-nums; }}
 .numeric {{ text-align:right; font-variant-numeric:tabular-nums; font-weight:750; }}
-.target-status {{ color:#b8c7e5; font-size:10px; }}
-.unit {{ color:var(--muted); font-weight:500; font-size:9px; }}
 .empty {{ border:1px dashed var(--line); border-radius:13px; color:var(--muted); padding:18px; font-size:12px; }}
-.empty.compact {{ padding:14px; }}
 .method {{ margin-top:18px; }}
 .method-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:14px; }}
 .method-item {{ padding:14px; border-radius:14px; background:#0d1422; border:1px solid var(--line); }}
@@ -920,7 +1337,7 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
   .method-grid {{ grid-template-columns:repeat(2,1fr); }}
 }}
 @media (max-width:820px) {{
-  .leaderboards {{ grid-template-columns:1fr; }}
+  .dashboard-grid {{ grid-template-columns:1fr; }}
   .momentum {{ grid-template-columns:repeat(2,1fr); }}
 }}
 @media (max-width:620px) {{
@@ -931,17 +1348,22 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
   .momentum {{ grid-template-columns:1fr 1fr; }}
   .method-grid {{ grid-template-columns:1fr; }}
   .bar-row {{ grid-template-columns:95px 1fr 46px; gap:7px; }}
-  .ranking-table th:nth-child(1),.ranking-table td:nth-child(1) {{ width:55px; }}
-  .ranking-table th:nth-child(3),.ranking-table td:nth-child(3) {{ width:102px; }}
+  .combined-bar-row {{ grid-template-columns:95px 1fr 72px; }}
+  .combined-table th:nth-child(1),.combined-table td:nth-child(1) {{ width:55px; }}
+  .combined-table th:nth-child(3),.combined-table td:nth-child(3),
+  .combined-table th:nth-child(4),.combined-table td:nth-child(4) {{ width:64px; }}
+  .quality-table {{ table-layout:auto; }}
+  .quality-table th:nth-child(n),.quality-table td:nth-child(n) {{ width:auto; }}
+  .audit-heading {{ flex-direction:column; }}
+  .audit-summary {{ justify-content:flex-start; }}
   .target-table {{ table-layout:auto; }}
   .target-table th:nth-child(n),.target-table td:nth-child(n) {{ width:auto; }}
-  .unit {{ display:none; }}
 }}
 @media print {{
   body {{ background:white; color:#111; }}
   .hero,.panel,.metric-card,.mini-leader {{ background:white; color:#111; box-shadow:none; }}
-  .hero-copy,.hero-meta,.panel p,.metric-label,.metric-sub,.mini-leader span,.method-item span {{ color:#555; }}
-  .leaderboards {{ grid-template-columns:1fr 1fr; }}
+  .hero-meta,.panel p,.metric-label,.metric-sub,.mini-leader span,.method-item span {{ color:#555; }}
+  .dashboard-grid {{ grid-template-columns:1fr 1fr; }}
 }}
 </style>
 </head>
@@ -971,12 +1393,14 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
     </div>
   </section>
 
-  <main class="leaderboards">
-    {annotation_card}
+  <main class="dashboard-grid">
+    {annotation_activity_card}
+    {proposal_activity_card}
     {full_clip_card}
-    {today_card}
-    {proposal_card}
+    {completion_quality_card}
   </main>
+
+  {compact_audit}
 
   <section class="panel method">
     <h2>How progress is counted</h2>
@@ -1155,6 +1579,13 @@ def main() -> int:
         excluded_clip_ids,
         excluded_annotators,
     )
+    audit = analyse_missing_details(
+        records,
+        start_row=args.start_row,
+        explicit_ai_names=ai_names,
+        excluded_clip_ids=excluded_clip_ids,
+        excluded_annotators=excluded_annotators,
+    )
 
     now_aest = dt.datetime.now(dt.timezone.utc).astimezone(AEST)
     output_path: Path = args.output
@@ -1176,18 +1607,33 @@ def main() -> int:
         # This should only be reachable if the just-written JSON was unreadable.
         raise RuntimeError(f"Could not load a progress JSON baseline from {progress_path.parent}")
     baseline_path, baseline_payload = baseline_result
-    baseline_counts = action_counts_from_progress_json(baseline_payload)
+    baseline_counts = counts_from_progress_json(baseline_payload, "actions_annotated")
+    baseline_proposal_counts = counts_from_progress_json(baseline_payload, "proposals")
+
+    human_names = set(stats["human_names"])
 
     today_counts = make_today_counts(
         stats["annotation_counts"],
         baseline_counts,
-        set(stats["human_names"]),
+        human_names,
     )
-    today_ranking = rank_counts(today_counts, include_zero_names=set(stats["human_names"]))
+    today_ranking = rank_counts(today_counts, include_zero_names=human_names)
+
+    proposals_today_counts = make_today_counts(
+        stats["proposal_counts"],
+        baseline_proposal_counts,
+        human_names,
+    )
+    proposals_today_ranking = rank_counts(
+        proposals_today_counts,
+        include_zero_names=human_names,
+    )
 
     current_html = render_dashboard(
         stats,
         today_ranking,
+        proposals_today_ranking,
+        audit,
         target_clips=args.target_clips,
         generated_at_aest=now_aest,
     )
@@ -1207,11 +1653,16 @@ def main() -> int:
     print(f"Full clip completions: {s['full_clip_completions']:,}")
     print(f"People at target ({args.target_clips} clips): {target_reached:,}")
     print(f"Human proposals: {s['total_proposals']:,}")
+    print(
+        f"Missing-detail findings: {audit['total_findings']:,} "
+        f"across {audit['people_affected']:,} people"
+    )
 
     print_ranking("Most annotations", stats["annotation_ranking"])
     print_ranking("Most fully annotated clips", stats["full_clip_ranking"])
     print_ranking("Actions annotated today", today_ranking)
     print_ranking("Most actions proposed", stats["proposal_ranking"])
+    print_ranking("Actions proposed today", proposals_today_ranking)
 
     print("\n=== REPORT ===")
     print(f"Current HTML:   {output_path}")
