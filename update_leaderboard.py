@@ -529,6 +529,106 @@ def analyse_missing_details(
     }
 
 
+
+def compress_number_ranges(numbers: list[int]) -> str:
+    numbers = sorted(set(numbers))
+    if not numbers:
+        return ""
+
+    ranges: list[str] = []
+    start = previous = numbers[0]
+
+    for number in numbers[1:]:
+        if number == previous + 1:
+            previous = number
+            continue
+        ranges.append(
+            str(start) if start == previous else f"{start}-{previous}"
+        )
+        start = previous = number
+
+    ranges.append(
+        str(start) if start == previous else f"{start}-{previous}"
+    )
+    return ", ".join(ranges)
+
+
+def analyse_proposal_details(
+    records: list[dict[str, Any]],
+    *,
+    start_row: int,
+    explicit_ai_names: set[str],
+    excluded_clip_ids: set[str],
+    excluded_annotators: set[str],
+) -> dict[str, Any]:
+    by_person: dict[str, dict[int, list[dict[str, Any]]]] = collections.defaultdict(
+        lambda: collections.defaultdict(list)
+    )
+
+    for original_index, record in enumerate(records, start=start_row):
+        row_number = original_index + 1
+        clip_id = normalize_name(record.get("clip_id"))
+
+        if is_excluded(clip_id, excluded_clip_ids):
+            continue
+
+        proposals = record.get("proposals") or []
+        if not isinstance(proposals, list):
+            continue
+
+        for proposal in proposals:
+            if not isinstance(proposal, dict):
+                continue
+
+            name = normalize_name(proposal.get("annotator_id"))
+
+            if is_excluded(name, excluded_annotators):
+                continue
+            if is_ai_annotator(name, explicit_ai_names):
+                continue
+
+            by_person[name][row_number].append(proposal)
+
+    rows: list[dict[str, Any]] = []
+
+    for name, clip_map in by_person.items():
+        clip_numbers = sorted(clip_map)
+        incomplete_clips = sorted(
+            row_number
+            for row_number, proposals in clip_map.items()
+            if len(proposals) < 2
+            or any(not proposal_is_complete(proposal) for proposal in proposals)
+        )
+
+        action_count = sum(len(proposals) for proposals in clip_map.values())
+        clip_count = len(clip_numbers)
+        incomplete_count = len(incomplete_clips)
+        completed_count = clip_count - incomplete_count
+        percentage = (
+            100.0 * completed_count / clip_count
+            if clip_count else 0.0
+        )
+
+        rows.append({
+            "name": name,
+            "actions": action_count,
+            "clips": clip_count,
+            "incomplete": incomplete_count,
+            "clip_ranges": compress_number_ranges(clip_numbers),
+            "incomplete_ranges": compress_number_ranges(incomplete_clips),
+            "percentage": percentage,
+        })
+
+    rows.sort(key=lambda row: (-row["actions"], row["name"].casefold()))
+
+    return {
+        "rows": rows,
+        "proposers": len(rows),
+        "incomplete_clips": sum(row["incomplete"] for row in rows),
+    }
+
+
+
 def rank_counts(
     counts: collections.Counter[str] | dict[str, int],
     *,
@@ -1093,11 +1193,72 @@ def render_compact_audit(audit: dict[str, Any]) -> str:
     '''
 
 
+
+def render_proposal_details(details: dict[str, Any]) -> str:
+    rows = details["rows"]
+
+    if not rows:
+        table = (
+            '<div class="proposal-clear">'
+            'No human proposal records found in the selected rows.'
+            '</div>'
+        )
+    else:
+        body = "".join(
+            '<tr>'
+            f'<td class="proposal-name">{esc(row["name"])}</td>'
+            f'<td class="numeric">{fmt_int(row["actions"])}</td>'
+            f'<td class="numeric">{fmt_int(row["clips"])}</td>'
+            f'<td class="numeric proposal-incomplete">{fmt_int(row["incomplete"])}</td>'
+            f'<td class="proposal-clips">{esc(row["clip_ranges"]) or "—"}</td>'
+            f'<td class="proposal-clips proposal-incomplete-ranges">'
+            f'{esc(row["incomplete_ranges"]) or "—"}</td>'
+            f'<td class="numeric">{row["percentage"]:.1f}%</td>'
+            '</tr>'
+            for row in rows
+        )
+
+        table = (
+            '<div class="proposal-table-wrap">'
+            '<table class="proposal-detail-table">'
+            '<thead><tr>'
+            '<th>Proposer</th>'
+            '<th>Actions</th>'
+            '<th>Clips</th>'
+            '<th>Incomplete</th>'
+            '<th>Clips</th>'
+            '<th>Incomplete clips</th>'
+            '<th>Complete</th>'
+            '</tr></thead>'
+            f'<tbody>{body}</tbody>'
+            '</table>'
+            '</div>'
+        )
+
+    return f"""
+    <section class="panel proposal-details">
+      <div class="proposal-details-heading">
+        <div>
+          <h2>Incomplete proposal details</h2>
+          <p>Incomplete = fewer than 2 proposals, or missing reason/facts.</p>
+        </div>
+        <div class="proposal-details-summary">
+          <span><b>{fmt_int(details["proposers"])}</b> proposers</span>
+          <span><b>{fmt_int(details["incomplete_clips"])}</b> incomplete</span>
+        </div>
+      </div>
+      {table}
+    </section>
+    """
+
+
+
 def render_dashboard(
     stats: dict[str, Any],
     today_ranking: list[dict[str, Any]],
     proposals_today_ranking: list[dict[str, Any]],
     audit: dict[str, Any],
+    proposal_details: dict[str, Any],
     *,
     target_clips: int,
     generated_at_aest: dt.datetime,
@@ -1176,6 +1337,7 @@ def render_dashboard(
     full_clip_card = render_target_card(stats["full_clip_ranking"], target_clips)
     completion_quality_card = render_completion_quality_card(stats)
     compact_audit = render_compact_audit(audit)
+    proposal_details_html = render_proposal_details(proposal_details)
 
     return f'''<!doctype html>
 <html lang="en">
@@ -1320,6 +1482,22 @@ tbody tr:hover td {{ background:#141d30; }}
 .audit-row,.audit-ca,.audit-band {{ white-space:nowrap; font-weight:700; }}
 .audit-action {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
 .audit-clear {{ padding:11px 13px; border:1px dashed rgba(103,216,159,.28); border-radius:10px; color:#9be9bf; font-size:11px; }}
+.proposal-details {{ margin-top:18px; padding:18px 20px; }}
+.proposal-details-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:12px; }}
+.proposal-details-heading h2 {{ margin:0; font-size:16px; }}
+.proposal-details-heading p {{ margin:4px 0 0; font-size:10px; line-height:1.5; max-width:900px; }}
+.proposal-details-summary {{ display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }}
+.proposal-details-summary span {{ padding:5px 8px; border:1px solid #3c5f54; border-radius:999px; background:rgba(103,216,159,.07); color:#aee8cb; font-size:9px; white-space:nowrap; }}
+.proposal-table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:12px; }}
+.proposal-detail-table {{ min-width:850px; table-layout:auto; }}
+.proposal-detail-table th,.proposal-detail-table td {{ padding:9px 10px; }}
+.proposal-detail-table .numeric {{ text-align:left; }}
+.proposal-detail-table th {{ font-size:8px; }}
+.proposal-detail-table td {{ font-size:10px; }}
+.proposal-name {{ min-width:150px; font-weight:800; }}
+.proposal-clips {{ min-width:150px; color:#cbd7ef; }}
+.proposal-incomplete,.proposal-incomplete-ranges {{ color:#ffb5b5; font-weight:800; }}
+.proposal-clear {{ padding:11px 13px; border:1px dashed var(--line); border-radius:10px; color:var(--muted); font-size:10px; }}
 .rank-cell {{ white-space:nowrap; }}
 .rank-number {{ display:inline-block; min-width:22px; font-weight:900; font-variant-numeric:tabular-nums; }}
 .medal {{ display:inline-block; width:22px; }}
@@ -1356,6 +1534,8 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
   .quality-table th:nth-child(n),.quality-table td:nth-child(n) {{ width:auto; }}
   .audit-heading {{ flex-direction:column; }}
   .audit-summary {{ justify-content:flex-start; }}
+  .proposal-details-heading {{ flex-direction:column; }}
+  .proposal-details-summary {{ justify-content:flex-start; }}
   .target-table {{ table-layout:auto; }}
   .target-table th:nth-child(n),.target-table td:nth-child(n) {{ width:auto; }}
 }}
@@ -1401,6 +1581,8 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
   </main>
 
   {compact_audit}
+
+  {proposal_details_html}
 
   <section class="panel method">
     <h2>How progress is counted</h2>
@@ -1586,6 +1768,13 @@ def main() -> int:
         excluded_clip_ids=excluded_clip_ids,
         excluded_annotators=excluded_annotators,
     )
+    proposal_details = analyse_proposal_details(
+        records,
+        start_row=args.start_row,
+        explicit_ai_names=ai_names,
+        excluded_clip_ids=excluded_clip_ids,
+        excluded_annotators=excluded_annotators,
+    )
 
     now_aest = dt.datetime.now(dt.timezone.utc).astimezone(AEST)
     output_path: Path = args.output
@@ -1634,6 +1823,7 @@ def main() -> int:
         today_ranking,
         proposals_today_ranking,
         audit,
+        proposal_details,
         target_clips=args.target_clips,
         generated_at_aest=now_aest,
     )
@@ -1656,6 +1846,10 @@ def main() -> int:
     print(
         f"Missing-detail findings: {audit['total_findings']:,} "
         f"across {audit['people_affected']:,} people"
+    )
+    print(
+        f"Incomplete proposal clips: {proposal_details['incomplete_clips']:,} "
+        f"across {proposal_details['proposers']:,} proposers"
     )
 
     print_ranking("Most annotations", stats["annotation_ranking"])
