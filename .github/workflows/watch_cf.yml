@@ -1,0 +1,71 @@
+name: Codeforces Watcher
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeforces-watcher
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Restore watcher state
+        uses: actions/cache/restore@v4
+        with:
+          path: .cf_state
+          key: codeforces-state-${{ github.run_id }}
+          restore-keys: |
+            codeforces-state-
+
+      - name: Create .env
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          USER_ID: ${{ secrets.DISCORD_USER_ID }}
+        shell: bash
+        run: |
+          {
+            printf 'DISCORD_WEBHOOK_URL=%s\n' "$WEBHOOK"
+            printf 'DISCORD_USER_ID=%s\n' "$USER_ID"
+          } > .env
+
+      - name: Check Codeforces and notify Discord
+        id: watcher
+        shell: bash
+        run: |
+          ARGS=(
+            --handle ngakanbagus18
+            --lookback-minutes 10
+            --state-file .cf_state/cf_state.json
+          )
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.test }}" == "true" ]]; then
+            python watch_discord.py "${ARGS[@]}" --test
+          else
+            python watch_discord.py "${ARGS[@]}"
+          fi
+
+      # Cache is immutable, so create a new cache only when the state changed.
+      # This avoids creating a pointless cache entry every 10 minutes.
+      - name: Save watcher state
+        if: ${{ steps.watcher.outputs.state_changed == 'true' }}
+        uses: actions/cache/save@v4
+        with:
+          path: .cf_state
+          key: codeforces-state-${{ github.run_id }}
