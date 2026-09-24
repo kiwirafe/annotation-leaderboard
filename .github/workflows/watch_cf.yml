@@ -4,6 +4,12 @@ on:
   schedule:
     - cron: '*/10 * * * *'
   workflow_dispatch:
+    inputs:
+      test:
+        description: "Send the latest existing submission as a test"
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -56,9 +62,9 @@ jobs:
           )
 
           if [[ "${{ github.event_name }}" == "workflow_dispatch" && "${{ inputs.test }}" == "true" ]]; then
-            python watch_discord.py "${ARGS[@]}" --test
+            python watch_cf.py "${ARGS[@]}" --test
           else
-            python watch_discord.py "${ARGS[@]}"
+            python watch_cf.py "${ARGS[@]}"
           fi
 
       # Cache is immutable, so create a new cache only when the state changed.
