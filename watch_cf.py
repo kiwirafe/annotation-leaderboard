@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check a Codeforces user's new submissions once and notify Discord."""
+"""Check multiple Codeforces users for new submissions and notify Discord."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 CF_API = "https://codeforces.com/api/user.status"
 CF_BASE = "https://codeforces.com"
 
-DEFAULT_HANDLE = "ngakanbagus18"
+DEFAULT_HANDLES = ["ngakanbagus18", "kavyasantha"]
 DEFAULT_LOOKBACK_MINUTES = 10
 DEFAULT_STATE_FILE = Path(".cf_state/cf_state.json")
 
@@ -56,7 +56,6 @@ def load_dotenv(path: Path = Path(".env")) -> None:
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
             value = value[1:-1]
 
-        # Existing environment variables (e.g. GitHub Actions) take precedence.
         os.environ.setdefault(key, value)
 
 
@@ -75,7 +74,7 @@ def http_json(
 ) -> Any:
     data = json.dumps(payload).encode() if payload is not None else None
     headers = {
-        "User-Agent": "CodeforcesDiscordWatcher/3.1",
+        "User-Agent": "CodeforcesDiscordWatcher/4.0",
         "Accept": "application/json",
     }
     if data is not None:
@@ -101,37 +100,53 @@ def fetch_submissions(handle: str) -> list[dict[str, Any]]:
     response = http_json(f"{CF_API}?{query}")
 
     if not isinstance(response, dict):
-        raise RuntimeError("Unexpected response from Codeforces")
+        raise RuntimeError(f"{handle}: unexpected response from Codeforces")
     if response.get("status") != "OK":
         raise RuntimeError(
-            f"Codeforces API error: {response.get('comment', 'unknown error')}"
+            f"{handle}: Codeforces API error: "
+            f"{response.get('comment', 'unknown error')}"
         )
 
     submissions = response.get("result")
     if not isinstance(submissions, list):
-        raise RuntimeError("Codeforces API returned an invalid submission list")
+        raise RuntimeError(f"{handle}: invalid submission list")
 
     return submissions
 
 
-def load_last_seen(path: Path) -> int | None:
+def load_state(path: Path) -> dict[str, int]:
     if not path.exists():
-        return None
+        return {}
 
     try:
-        return int(json.loads(path.read_text(encoding="utf-8"))["last_seen_submission_id"])
-    except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+
+        # Current multi-user format.
+        if isinstance(raw.get("last_seen"), dict):
+            return {
+                str(handle): int(submission_id)
+                for handle, submission_id in raw["last_seen"].items()
+            }
+
+        # Backward compatibility with the old single-user state file.
+        if "last_seen_submission_id" in raw:
+            return {
+                DEFAULT_HANDLES[0]: int(raw["last_seen_submission_id"])
+            }
+
+        raise ValueError("missing last_seen")
+    except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             f"Could not read state file {path}. "
-            "Delete it to fall back to the lookback window."
+            "Delete it to rebuild state from the lookback window."
         ) from exc
 
 
-def save_last_seen(path: Path, submission_id: int) -> None:
+def save_state(path: Path, state: dict[str, int]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(
-        json.dumps({"last_seen_submission_id": submission_id}, indent=2) + "\n",
+        json.dumps({"last_seen": state}, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     tmp.replace(path)
@@ -188,8 +203,6 @@ def verdict_text(submission: dict[str, Any]) -> str:
 def submission_time_sydney(submission: dict[str, Any]) -> str:
     created = int(submission.get("creationTimeSeconds") or time.time())
     local = datetime.fromtimestamp(created, tz=SYDNEY_TZ)
-
-    # Cross-platform 12-hour formatting without %-I.
     hour = local.strftime("%I").lstrip("0") or "12"
     return f"{local:%d %b %Y}, {hour}:{local:%M:%S %p %Z}"
 
@@ -218,7 +231,6 @@ def send_discord_notification(
         },
         "embeds": [
             {
-                # Intentionally no "url" here: the title is plain text.
                 "title": title,
                 "description": f"{linked_handle} submitted **{problem}**.",
                 "fields": [
@@ -279,64 +291,86 @@ def positive_int(value: str) -> int:
     return number
 
 
+def normalize_handles(values: list[str]) -> list[str]:
+    """Accept space-separated handles and/or comma-separated groups."""
+    handles: list[str] = []
+
+    for value in values:
+        for handle in value.split(","):
+            handle = handle.strip()
+            if handle and handle not in handles:
+                handles.append(handle)
+
+    if not handles:
+        raise argparse.ArgumentTypeError("at least one handle is required")
+
+    return handles
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Check once for new Codeforces submissions and notify Discord."
+        description="Check multiple Codeforces users and notify Discord."
     )
-    parser.add_argument("--handle", default=DEFAULT_HANDLE)
+    parser.add_argument(
+        "--handles",
+        nargs="+",
+        default=DEFAULT_HANDLES,
+        metavar="HANDLE",
+        help=(
+            "Codeforces handles to watch. "
+            "Example: --handles ngakanbagus18 tourist Benq"
+        ),
+    )
     parser.add_argument(
         "--lookback-minutes",
         type=positive_int,
         default=DEFAULT_LOOKBACK_MINUTES,
-        help="Fallback window used only when no state file exists.",
+        help="Fallback window used only for handles with no saved state.",
     )
     parser.add_argument(
         "--state-file",
         type=Path,
         default=DEFAULT_STATE_FILE,
-        help="File storing the last-seen submission ID.",
+        help="JSON file storing the last-seen submission ID for each handle.",
     )
     parser.add_argument(
         "--test",
         action="store_true",
-        help="Send the latest submission as a test without changing state.",
+        help="Send each watched user's latest submission as a test.",
     )
-    return parser.parse_args()
+
+    args = parser.parse_args()
+    args.handles = normalize_handles(args.handles)
+    return args
 
 
-def main() -> int:
-    load_dotenv()
-    args = parse_args()
-    webhook_url, discord_user_id = discord_config()
-    set_github_output("state_changed", "false")
+def process_handle(
+    handle: str,
+    *,
+    state: dict[str, int],
+    state_file: Path,
+    lookback_minutes: int,
+    webhook_url: str,
+    discord_user_id: str,
+) -> int:
+    submissions = fetch_submissions(handle)
 
-    submissions = fetch_submissions(args.handle)
     if not submissions:
-        print(f"{args.handle} has no public submissions.")
+        print(f"{handle}: no public submissions.")
         return 0
 
-    if args.test:
-        send_discord_notification(
-            webhook_url,
-            discord_user_id,
-            args.handle,
-            submissions[0],
-            test=True,
-        )
-        print("Test notification sent.")
-        return 0
-
-    last_seen = load_last_seen(args.state_file)
+    last_seen = state.get(handle)
 
     if last_seen is None:
-        cutoff = int(time.time()) - args.lookback_minutes * 60
+        cutoff = int(time.time()) - lookback_minutes * 60
         unseen = [
             submission
             for submission in submissions
             if int(submission.get("creationTimeSeconds", 0)) >= cutoff
         ]
         print(
-            f"No state found; checking the last {args.lookback_minutes} minute(s)."
+            f"{handle}: no saved state; checking the last "
+            f"{lookback_minutes} minute(s)."
         )
     else:
         unseen = [
@@ -351,24 +385,72 @@ def main() -> int:
         send_discord_notification(
             webhook_url,
             discord_user_id,
-            args.handle,
+            handle,
             submission,
         )
-        save_last_seen(args.state_file, int(submission["id"]))
+
+        state[handle] = int(submission["id"])
+        save_state(state_file, state)
+
         print(
-            f"Notified: {problem_name(submission)} — "
+            f"{handle}: notified {problem_name(submission)} — "
             f"{verdict_text(submission)} — "
             f"{submission_time_sydney(submission)}"
         )
 
+    if not unseen and last_seen is None:
+        # First time watching this handle: establish a baseline.
+        state[handle] = max(int(submission["id"]) for submission in submissions)
+        save_state(state_file, state)
+
     if not unseen:
-        # Bootstrap state on the first run so future checks use submission IDs.
-        if last_seen is None:
-            newest_id = max(int(submission["id"]) for submission in submissions)
-            save_last_seen(args.state_file, newest_id)
+        print(f"{handle}: no new submissions.")
 
-        print("No new submissions.")
+    return len(unseen)
 
+
+def main() -> int:
+    load_dotenv()
+    args = parse_args()
+    webhook_url, discord_user_id = discord_config()
+    set_github_output("state_changed", "false")
+
+    state = load_state(args.state_file)
+
+    if args.test:
+        for handle in args.handles:
+            submissions = fetch_submissions(handle)
+            if not submissions:
+                print(f"{handle}: no public submissions.")
+                continue
+
+            send_discord_notification(
+                webhook_url,
+                discord_user_id,
+                handle,
+                submissions[0],
+                test=True,
+            )
+            print(f"{handle}: test notification sent.")
+
+        return 0
+
+    total = 0
+
+    for handle in args.handles:
+        total += process_handle(
+            handle,
+            state=state,
+            state_file=args.state_file,
+            lookback_minutes=args.lookback_minutes,
+            webhook_url=webhook_url,
+            discord_user_id=discord_user_id,
+        )
+
+    print(
+        f"Done. Watched {len(args.handles)} user(s); "
+        f"sent {total} notification(s)."
+    )
     return 0
 
 
