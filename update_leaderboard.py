@@ -530,6 +530,47 @@ def analyse_missing_details(
 
 
 
+def parse_number_ranges(value: str) -> set[int]:
+    """Parse clip numbers/ranges such as ``1-30, 38, 50-70``.
+
+    Clip numbers are the 1-based row numbers shown in the proposal-details table.
+    Whitespace is ignored. Overlapping ranges and duplicate numbers are harmless.
+    """
+    value = str(value or "").strip()
+    if not value:
+        return set()
+
+    numbers: set[int] = set()
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+
+        match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+        if match:
+            start = int(match.group(1))
+            end = int(match.group(2))
+            if start <= 0 or end <= 0:
+                raise ValueError("clip numbers must be >= 1")
+            if start > end:
+                raise ValueError(f"invalid clip range {part!r}: start is greater than end")
+            numbers.update(range(start, end + 1))
+            continue
+
+        if re.fullmatch(r"\d+", part):
+            number = int(part)
+            if number <= 0:
+                raise ValueError("clip numbers must be >= 1")
+            numbers.add(number)
+            continue
+
+        raise ValueError(
+            f"invalid clip/range {part!r}; expected values like '1-30, 38, 50-70'"
+        )
+
+    return numbers
+
+
 def compress_number_ranges(numbers: list[int]) -> str:
     numbers = sorted(set(numbers))
     if not numbers:
@@ -560,6 +601,7 @@ def analyse_proposal_details(
     explicit_ai_names: set[str],
     excluded_clip_ids: set[str],
     excluded_annotators: set[str],
+    ignored_incomplete_clip_numbers: set[int],
 ) -> dict[str, Any]:
     by_person: dict[str, dict[int, list[dict[str, Any]]]] = collections.defaultdict(
         lambda: collections.defaultdict(list)
@@ -593,20 +635,29 @@ def analyse_proposal_details(
 
     for name, clip_map in by_person.items():
         clip_numbers = sorted(clip_map)
+        considered_clip_numbers = [
+            row_number
+            for row_number in clip_numbers
+            if row_number not in ignored_incomplete_clip_numbers
+        ]
         incomplete_clips = sorted(
             row_number
             for row_number, proposals in clip_map.items()
-            if len(proposals) < 2
-            or any(not proposal_is_complete(proposal) for proposal in proposals)
+            if row_number not in ignored_incomplete_clip_numbers
+            and (
+                len(proposals) < 2
+                or any(not proposal_is_complete(proposal) for proposal in proposals)
+            )
         )
 
         action_count = sum(len(proposals) for proposals in clip_map.values())
         clip_count = len(clip_numbers)
         incomplete_count = len(incomplete_clips)
-        completed_count = clip_count - incomplete_count
+        considered_count = len(considered_clip_numbers)
+        completed_count = considered_count - incomplete_count
         percentage = (
-            100.0 * completed_count / clip_count
-            if clip_count else 0.0
+            100.0 * completed_count / considered_count
+            if considered_count else 0.0
         )
 
         rows.append({
@@ -625,6 +676,7 @@ def analyse_proposal_details(
         "rows": rows,
         "proposers": len(rows),
         "incomplete_clips": sum(row["incomplete"] for row in rows),
+        "ignored_incomplete_clip_numbers": sorted(ignored_incomplete_clip_numbers),
     }
 
 
@@ -1196,6 +1248,12 @@ def render_compact_audit(audit: dict[str, Any]) -> str:
 
 def render_proposal_details(details: dict[str, Any]) -> str:
     rows = details["rows"]
+    ignored_clip_numbers = details.get("ignored_incomplete_clip_numbers", [])
+    ignored_ranges = compress_number_ranges(list(ignored_clip_numbers))
+    ignore_note = (
+        f" Ignored for incompleteness: {esc(ignored_ranges)}."
+        if ignored_ranges else ""
+    )
 
     if not rows:
         table = (
@@ -1240,7 +1298,7 @@ def render_proposal_details(details: dict[str, Any]) -> str:
       <div class="proposal-details-heading">
         <div>
           <h2>Incomplete proposal details</h2>
-          <p>Incomplete = fewer than 2 proposals, or missing reason/facts.</p>
+          <p>Incomplete = fewer than 2 proposals, or missing reason/facts.{ignore_note}</p>
         </div>
         <div class="proposal-details-summary">
           <span><b>{fmt_int(details["proposers"])}</b> proposers</span>
@@ -1688,6 +1746,16 @@ def parse_args() -> argparse.Namespace:
         help="Additional annotator name to classify as AI/model. May be repeated.",
     )
     parser.add_argument(
+        "--ignore-incomplete-proposal-clips",
+        default=os.getenv("IGNORE_INCOMPLETE_PROPOSAL_CLIPS", ""),
+        metavar="RANGES",
+        help=(
+            "1-based clip numbers/ranges to ignore only when calculating Incomplete "
+            "proposal details, e.g. '1-30, 38, 50-70'. Can also be set with "
+            "IGNORE_INCOMPLETE_PROPOSAL_CLIPS."
+        ),
+    )
+    parser.add_argument(
         "--exclude-clip",
         action="append",
         default=[],
@@ -1718,6 +1786,10 @@ def main() -> int:
         raise ValueError("-n/--num-rows must be > 0")
     if args.target_clips <= 0:
         raise ValueError("--target-clips must be > 0")
+
+    ignored_incomplete_proposal_clips = parse_number_ranges(
+        args.ignore_incomplete_proposal_clips
+    )
 
     if args.input is not None:
         export_path = args.input
@@ -1774,6 +1846,7 @@ def main() -> int:
         explicit_ai_names=ai_names,
         excluded_clip_ids=excluded_clip_ids,
         excluded_annotators=excluded_annotators,
+        ignored_incomplete_clip_numbers=ignored_incomplete_proposal_clips,
     )
 
     now_aest = dt.datetime.now(dt.timezone.utc).astimezone(AEST)
@@ -1837,6 +1910,10 @@ def main() -> int:
 
     print(f"Excluded clips: {', '.join(sorted(excluded_clip_ids)) or 'none'}")
     print(f"Excluded annotators: {', '.join(sorted(excluded_annotators)) or 'none'}")
+    print(
+        "Ignored incomplete proposal clips: "
+        f"{compress_number_ranges(sorted(ignored_incomplete_proposal_clips)) or 'none'}"
+    )
     print(f"Human contributors: {s['human_contributors']:,}")
     print(f"Canonical-action annotations: {s['total_annotations']:,}")
     print(f"Actions annotated today: {total_today:,}")

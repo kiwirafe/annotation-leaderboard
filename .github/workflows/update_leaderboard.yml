@@ -16,6 +16,7 @@ concurrency:
 
 env:
   TARGET_CLIPS: '10'
+  IGNORE_INCOMPLETE_PROPOSAL_CLIPS: '1-30'
 
 jobs:
   update-and-deploy:
