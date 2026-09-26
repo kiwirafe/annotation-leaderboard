@@ -635,11 +635,6 @@ def analyse_proposal_details(
 
     for name, clip_map in by_person.items():
         clip_numbers = sorted(clip_map)
-        considered_clip_numbers = [
-            row_number
-            for row_number in clip_numbers
-            if row_number not in ignored_incomplete_clip_numbers
-        ]
         incomplete_clips = sorted(
             row_number
             for row_number, proposals in clip_map.items()
@@ -653,11 +648,12 @@ def analyse_proposal_details(
         action_count = sum(len(proposals) for proposals in clip_map.values())
         clip_count = len(clip_numbers)
         incomplete_count = len(incomplete_clips)
-        considered_count = len(considered_clip_numbers)
-        completed_count = considered_count - incomplete_count
+
+        # Ignored clips stay in the denominator and are treated as completed.
+        completed_count = clip_count - incomplete_count
         percentage = (
-            100.0 * completed_count / considered_count
-            if considered_count else 0.0
+            100.0 * completed_count / clip_count
+            if clip_count else 0.0
         )
 
         rows.append({
@@ -1750,7 +1746,7 @@ def parse_args() -> argparse.Namespace:
         default=os.getenv("IGNORE_INCOMPLETE_PROPOSAL_CLIPS", ""),
         metavar="RANGES",
         help=(
-            "1-based clip numbers/ranges to ignore only when calculating Incomplete "
+            "1-based clip numbers/ranges to treat as completed in Incomplete "
             "proposal details, e.g. '1-30, 38, 50-70'. Can also be set with "
             "IGNORE_INCOMPLETE_PROPOSAL_CLIPS."
         ),
