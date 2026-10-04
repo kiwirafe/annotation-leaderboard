@@ -56,7 +56,7 @@ jobs:
         shell: bash
         run: |
           ARGS=(
-            --handle ngakanbagus18
+            --handle ngakanbagus18 kavyasantha
             --lookback-minutes 10
             --state-file .cf_state/cf_state.json
           )

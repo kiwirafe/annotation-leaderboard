@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 CF_API = "https://codeforces.com/api/user.status"
 CF_BASE = "https://codeforces.com"
 
-DEFAULT_HANDLES = ["ngakanbagus18", "kavyasantha"]
+DEFAULT_HANDLES = ["ngakanbagus18"]
 DEFAULT_LOOKBACK_MINUTES = 10
 DEFAULT_STATE_FILE = Path(".cf_state/cf_state.json")
 

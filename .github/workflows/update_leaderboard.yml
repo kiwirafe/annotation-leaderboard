@@ -15,7 +15,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  TARGET_CLIPS: '10'
+  TARGET_CLIPS: '45'
   IGNORE_INCOMPLETE_PROPOSAL_CLIPS: '1-30'
 
 jobs:
