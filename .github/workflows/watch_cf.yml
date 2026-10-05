@@ -1,8 +1,6 @@
 name: Codeforces Watcher
 
 on:
-  schedule:
-    - cron: '*/10 * * * *'
   workflow_dispatch:
     inputs:
       test:
