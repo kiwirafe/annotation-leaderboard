@@ -4,16 +4,16 @@
 The dashboard focuses on four human contribution views:
   1. Most canonical-action annotations overall
   2. Most fully annotated clips, measured against a configurable per-person target
-  3. Most canonical-action annotations added during the current AEST day
+  3. Most canonical-action annotations added during the current NSW local day
   4. Most human action proposals
 
 Output/history behaviour:
   - The current dashboard is overwritten on every run.
   - Every run also writes one compact JSON progress snapshot. Its filename contains
-    the AEST hour, while its body contains ONLY the three per-person counters needed
+    the NSW local hour, while its body contains ONLY the three per-person counters needed
     for history: actions annotated, clips fully annotated, and proposals.
   - "Actions annotated today" is calculated from the earliest saved progress JSON
-    snapshot for the current AEST date. This does not depend on annotation timestamps,
+    snapshot for the current NSW local date. This does not depend on annotation timestamps,
     which are not present in the current export structure.
 
 Counting rules:
@@ -49,6 +49,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
 
 DEFAULT_URL = "https://annotation.rainsproj.com"
@@ -57,8 +58,8 @@ DEFAULT_EXPORT = Path("inputs/annotation_export.jsonl")
 DEFAULT_OUTPUT = Path("reports/annotation_leaderboard.html")
 DEFAULT_TARGET_CLIPS = 10
 
-# The user explicitly requested AEST. AEST is fixed UTC+10; it does not move to AEDT.
-AEST = dt.timezone(dt.timedelta(hours=10), name="AEST")
+# NSW local time, including automatic daylight-saving transitions (AEST/AEDT).
+NSW_TZ = ZoneInfo("Australia/Sydney")
 
 REQUEST_HEADERS = {
     "Accept": "application/json",
@@ -827,11 +828,11 @@ def make_progress_json_payload(stats: dict[str, Any]) -> dict[str, dict[str, int
     }
 
 
-def progress_json_snapshot_path(progress_json_dir: Path, when_aest: dt.datetime) -> Path:
-    """Return one deterministic snapshot path per AEST clock hour."""
-    hour = when_aest.replace(minute=0, second=0, microsecond=0)
+def progress_json_snapshot_path(progress_json_dir: Path, when_nsw: dt.datetime) -> Path:
+    """Return one deterministic snapshot path per NSW local clock hour."""
+    hour = when_nsw.replace(minute=0, second=0, microsecond=0)
     day_dir = progress_json_dir / hour.date().isoformat()
-    filename = f"{PROGRESS_JSON_PREFIX}_{hour:%Y-%m-%d_%H00}_AEST.json"
+    filename = f"{PROGRESS_JSON_PREFIX}_{hour:%Y-%m-%d_%H00}_NSW.json"
     return day_dir / filename
 
 
@@ -870,14 +871,14 @@ def load_progress_json(path: Path) -> dict[str, dict[str, int]] | None:
 
 def find_day_baseline(
     progress_json_dir: Path,
-    aest_date: dt.date,
+    nsw_date: dt.date,
 ) -> tuple[Path, dict[str, dict[str, int]]] | None:
-    """Return the earliest valid progress JSON snapshot saved for an AEST date."""
-    day_dir = progress_json_dir / aest_date.isoformat()
+    """Return the earliest valid progress JSON snapshot saved for an NSW local date."""
+    day_dir = progress_json_dir / nsw_date.isoformat()
     if not day_dir.is_dir():
         return None
 
-    pattern = f"{PROGRESS_JSON_PREFIX}_{aest_date.isoformat()}_*_AEST.json"
+    pattern = f"{PROGRESS_JSON_PREFIX}_{nsw_date.isoformat()}_*_NSW.json"
     for path in sorted(day_dir.glob(pattern), key=lambda item: item.name):
         payload = load_progress_json(path)
         if payload is not None:
@@ -1315,7 +1316,7 @@ def render_dashboard(
     proposal_details: dict[str, Any],
     *,
     target_clips: int,
-    generated_at_aest: dt.datetime,
+    generated_at_nsw: dt.datetime,
 ) -> str:
     s = stats["summary"]
     ai_names = ", ".join(stats["ai_names"]) if stats["ai_names"] else "none detected"
@@ -1607,7 +1608,7 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
     <div class="eyebrow">Temporal NoRA · contribution board</div>
     <h1>Team Annotation Progress</h1>
     <div class="hero-meta">
-      <span class="mode-pill"><b>Last Updated:</b> {esc(generated_at_aest.strftime("%d %B %Y, %I:%M %p AEST").lstrip("0"))}</span>
+      <span class="mode-pill"><b>Last Updated:</b> {esc(generated_at_nsw.strftime("%d %B %Y, %I:%M %p %Z").lstrip("0"))}</span>
       <span class="mode-pill"><b>Target Clips:</b> {fmt_int(target_clips)}</span>
     </div>
   </section>
@@ -1640,7 +1641,7 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
 
   <section class="panel method">
     <h2>How progress is counted</h2>
-    <p>The daily metric is derived from the earliest saved progress JSON snapshot for the current AEST date because the annotation objects in the export do not contain reliable per-action timestamps.</p>
+    <p>The daily metric is derived from the earliest saved progress JSON snapshot for the current NSW local date because the annotation objects in the export do not contain reliable per-action timestamps.</p>
     <div class="method-grid">
       <div class="method-item">
         <b>One annotation = one canonical action</b>
@@ -1652,7 +1653,7 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
       </div>
       <div class="method-item">
         <b>Today's annotations</b>
-        <span>Current cumulative annotation count minus the earliest saved progress JSON snapshot for today's AEST date, per person. Negative differences are clamped to zero.</span>
+        <span>Current cumulative annotation count minus the earliest saved progress JSON snapshot for today's NSW local date, per person. Negative differences are clamped to zero.</span>
       </div>
       <div class="method-item">
         <b>Human leaderboards only</b>
@@ -1845,14 +1846,14 @@ def main() -> int:
         ignored_incomplete_clip_numbers=ignored_incomplete_proposal_clips,
     )
 
-    now_aest = dt.datetime.now(dt.timezone.utc).astimezone(AEST)
+    now_nsw = dt.datetime.now(NSW_TZ)
     output_path: Path = args.output
     progress_json_dir = args.progress_json_dir or (output_path.parent / "progress_json")
 
     # Persist this run's compact progress counters first. The timestamp belongs in
     # the filename so the JSON body contains only the requested per-person metrics.
     progress_payload = make_progress_json_payload(stats)
-    progress_path = progress_json_snapshot_path(progress_json_dir, now_aest)
+    progress_path = progress_json_snapshot_path(progress_json_dir, now_nsw)
     progress_created = False
     if not progress_path.exists():
         write_json_atomic(progress_path, progress_payload)
@@ -1860,7 +1861,7 @@ def main() -> int:
     else:
         print(f"Progress JSON already exists; keeping immutable snapshot: {progress_path}")
 
-    baseline_result = find_day_baseline(progress_json_dir, now_aest.date())
+    baseline_result = find_day_baseline(progress_json_dir, now_nsw.date())
     if baseline_result is None:
         # This should only be reachable if the just-written JSON was unreadable.
         raise RuntimeError(f"Could not load a progress JSON baseline from {progress_path.parent}")
@@ -1894,7 +1895,7 @@ def main() -> int:
         audit,
         proposal_details,
         target_clips=args.target_clips,
-        generated_at_aest=now_aest,
+        generated_at_nsw=now_nsw,
     )
     write_text_atomic(output_path, current_html)
 
@@ -1935,7 +1936,7 @@ def main() -> int:
     print(f"Current HTML:   {output_path}")
     print(f"Progress JSON:  {progress_path}{' (created)' if progress_created else ' (existing)'}")
     print(f"Today's baseline: {baseline_path}")
-    print(f"AEST date:      {now_aest.date().isoformat()}")
+    print(f"NSW local date: {now_nsw.date().isoformat()} ({now_nsw.tzname()})")
     return 0
 
 
