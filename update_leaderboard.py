@@ -1126,7 +1126,7 @@ def render_completion_quality_card(stats: dict[str, Any]) -> str:
         <div class="panel-icon">✨</div>
         <div>
           <h2>Completion quality</h2>
-          <p>Properly completed actions as a percentage of actions each person has started.</p>
+          <p>A video is only completed if all annotations are completed with proper justifications.</p>
         </div>
       </div>
       {top_html}
@@ -1398,7 +1398,7 @@ def render_dashboard(
 
     annotation_activity_card = render_combined_activity_card(
         "Annotation progress",
-        "Completed actions from each person's current action × band matrix, with today's new annotations shown alongside.",
+        "Number of completed annotations",
         stats["annotation_ranking"],
         today_ranking,
         "annotations",
@@ -1407,7 +1407,7 @@ def render_dashboard(
     )
     proposal_activity_card = render_combined_activity_card(
         "Proposal progress",
-        "Overall valid action proposals with today's new valid proposals shown alongside.",
+        "Number of action proposals.",
         stats["proposal_ranking"],
         proposals_today_ranking,
         "proposals",
