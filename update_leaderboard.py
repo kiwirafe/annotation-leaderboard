@@ -22,9 +22,10 @@ Counting rules:
       * action_judgment == "yes" requires reason_judgment to be present and not "unset";
       * action_judgment == "no" requires rejection_reasons to be non-empty.
     Individual horizon judgments are not separate annotations.
-  - A clip is fully annotated by a person only when every action in that clip's
-    canonical_action_pool has a complete judgment for all five expected horizons:
-    H10, H60, H30M, H1H, H3H.
+  - A clip is fully annotated by a person only when every action in that person's
+    current action × band matrix has a complete judgment for all five expected horizons
+    (H10, H60, H30M, H1H, H3H). The matrix is the intersection of the clip's current
+    canonical_action_pool and that annotator's canonical_actions.
   - A proposal counts only when it has a non-empty reason and at least one associated fact_id.
   - Known model annotators and explicit exclusions are excluded from all human rankings.
 
@@ -305,11 +306,19 @@ def action_is_complete(action: dict[str, Any]) -> bool:
     )
 
 
-def clip_is_fully_annotated(
+def current_matrix_actions(
     canonical_pool: list[Any],
     annotation: dict[str, Any],
-) -> bool:
-    """Return True when every canonical action is complete for this annotator."""
+) -> list[dict[str, Any]]:
+    """Return this annotator's actions that are still in the current action × band matrix.
+
+    The current matrix is the intersection of:
+      1. canonical_action_pool for the clip (the current clip-level canonical set), and
+      2. annotation.canonical_actions for this annotator (the rows actually present in
+         that annotator's matrix).
+
+    Raw proposal entries are deliberately not consulted here.
+    """
     pool_ids = {
         str(item.get("canonical_action_id")).strip()
         for item in canonical_pool
@@ -317,17 +326,29 @@ def clip_is_fully_annotated(
     }
     pool_ids.discard("")
     if not pool_ids:
-        return False
+        return []
 
-    action_map = {
-        str(action.get("canonical_action_id")).strip(): action
-        for action in (annotation.get("canonical_actions") or [])
-        if isinstance(action, dict) and action.get("canonical_action_id") is not None
-    }
-    return all(
-        canonical_id in action_map and action_is_complete(action_map[canonical_id])
-        for canonical_id in pool_ids
-    )
+    actions = annotation.get("canonical_actions") or []
+    if not isinstance(actions, list):
+        return []
+
+    matrix_actions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+    for action in actions:
+        if not isinstance(action, dict):
+            continue
+        canonical_id = audit_canonical_id(action)
+        if not canonical_id or canonical_id not in pool_ids or canonical_id in seen_ids:
+            continue
+        matrix_actions.append(action)
+        seen_ids.add(canonical_id)
+
+    return matrix_actions
+
+
+def clip_is_fully_annotated(matrix_actions: list[dict[str, Any]]) -> bool:
+    """Return True when every action in this annotator's current matrix is complete."""
+    return bool(matrix_actions) and all(action_is_complete(action) for action in matrix_actions)
 
 def proposal_is_complete(proposal: dict[str, Any]) -> bool:
     """Return True only when a proposal has a reason and at least one associated fact."""
@@ -397,15 +418,21 @@ def audit_missing_required_detail(judgment: dict[str, Any] | None) -> bool:
 
 def compress_audit_findings(
     row_number: int,
-    pool: list[dict[str, Any]],
-    affected: set[tuple[int, str]],
+    matrix_actions: list[dict[str, Any]],
+    affected: set[tuple[str, str]],
 ) -> list[dict[str, Any]]:
-    if not pool or not affected:
+    """Compress missing-detail findings for only the current matrix actions."""
+    if not matrix_actions or not affected:
         return []
 
+    action_by_id = {
+        audit_canonical_id(action): action
+        for action in matrix_actions
+        if audit_canonical_id(action)
+    }
     all_cells = {
-        (ca_number, horizon)
-        for ca_number in range(1, len(pool) + 1)
+        (canonical_id, horizon)
+        for canonical_id in action_by_id
         for horizon in EXPECTED_HORIZONS
     }
 
@@ -419,22 +446,26 @@ def compress_audit_findings(
 
     findings: list[dict[str, Any]] = []
 
-    for ca_number, pool_item in enumerate(pool, start=1):
+    for action in matrix_actions:
+        canonical_id = audit_canonical_id(action)
+        if not canonical_id:
+            continue
+
         affected_horizons = [
             horizon
             for horizon in EXPECTED_HORIZONS
-            if (ca_number, horizon) in affected
+            if (canonical_id, horizon) in affected
         ]
         if not affected_horizons:
             continue
 
-        action = audit_action_text(pool_item)
+        action_text = audit_action_text(action)
 
         if len(affected_horizons) == len(EXPECTED_HORIZONS):
             findings.append({
                 "row": row_number,
-                "ca": f"CA{ca_number}",
-                "action": action,
+                "ca": canonical_id,
+                "action": action_text,
                 "band": "ALL",
             })
             continue
@@ -442,12 +473,13 @@ def compress_audit_findings(
         for horizon in affected_horizons:
             findings.append({
                 "row": row_number,
-                "ca": f"CA{ca_number}",
-                "action": action,
+                "ca": canonical_id,
+                "action": action_text,
                 "band": HORIZON_LABELS.get(horizon, horizon),
             })
 
     return findings
+
 
 
 def analyse_missing_details(
@@ -468,11 +500,11 @@ def analyse_missing_details(
             continue
 
         pool_raw = record.get("canonical_action_pool") or []
-        pool = [
+        canonical_pool = [
             item for item in pool_raw if isinstance(item, dict)
         ] if isinstance(pool_raw, list) else []
 
-        if not pool:
+        if not canonical_pool:
             continue
 
         for annotation in record.get("annotations") or []:
@@ -486,30 +518,25 @@ def analyse_missing_details(
             if is_ai_annotator(name, explicit_ai_names):
                 continue
 
-            actions = annotation.get("canonical_actions") or []
-            action_map = {
-                audit_canonical_id(action): action
-                for action in actions
-                if isinstance(action, dict) and audit_canonical_id(action)
-            } if isinstance(actions, list) else {}
+            matrix_actions = current_matrix_actions(canonical_pool, annotation)
+            if not matrix_actions:
+                continue
 
-            affected: set[tuple[int, str]] = set()
+            affected: set[tuple[str, str]] = set()
 
-            for ca_number, pool_item in enumerate(pool, start=1):
-                cid = audit_canonical_id(pool_item)
-                action = action_map.get(cid) if cid else None
-
+            for action in matrix_actions:
+                canonical_id = audit_canonical_id(action)
                 for horizon in EXPECTED_HORIZONS:
                     judgment = audit_judgment(action, horizon)
                     state = audit_judgment_state(judgment)
 
                     if state in {"yes", "no"} and audit_missing_required_detail(judgment):
-                        affected.add((ca_number, horizon))
+                        affected.add((canonical_id, horizon))
 
             by_person[name].extend(
                 compress_audit_findings(
                     row_number=row_number,
-                    pool=pool,
+                    matrix_actions=matrix_actions,
                     affected=affected,
                 )
             )
@@ -753,17 +780,14 @@ def analyse(
                 continue
             human_names.add(name)
 
-            actions = annotation.get("canonical_actions") or []
-            if isinstance(actions, list):
-                for action in actions:
-                    if not isinstance(action, dict):
-                        continue
-                    if action_is_started(action):
-                        started_action_counts[name] += 1
-                    if action_is_complete(action):
-                        annotation_counts[name] += 1
+            matrix_actions = current_matrix_actions(canonical_pool, annotation)
+            for action in matrix_actions:
+                if action_is_started(action):
+                    started_action_counts[name] += 1
+                if action_is_complete(action):
+                    annotation_counts[name] += 1
 
-            if clip_is_fully_annotated(canonical_pool, annotation):
+            if clip_is_fully_annotated(matrix_actions):
                 full_clip_sets[name].add(clip_id)
 
     full_clip_counts = collections.Counter(
@@ -961,6 +985,7 @@ def render_combined_activity_card(
         total = int(row["count"])
         today = int(today_by_name.get(name, 0))
         width = 100.0 * total / max_count
+        today_class = "today-zero" if today == 0 else "today-positive"
 
         bars.append(
             '<div class="bar-row combined-bar-row">'
@@ -972,7 +997,7 @@ def render_combined_activity_card(
             '</div>'
             f'<div class="bar-count combined-bar-count">'
             f'<b>{fmt_int(total)}</b>'
-            f'<span class="today-inline">+{fmt_int(today)}</span>'
+            f'<span class="today-inline {today_class}">+{fmt_int(today)}</span>'
             '</div>'
             '</div>'
         )
@@ -983,7 +1008,7 @@ def render_combined_activity_card(
             f'<span class="medal">{medal_for_rank(rank)}</span></td>'
             f'<td><span class="person-name">{esc(name)}</span></td>'
             f'<td class="numeric combined-total">{fmt_int(total)}</td>'
-            f'<td class="numeric today-value">+{fmt_int(today)}</td>'
+            f'<td class="numeric today-value {today_class}">+{fmt_int(today)}</td>'
             '</tr>'
         )
 
@@ -1230,7 +1255,7 @@ def render_compact_audit(audit: dict[str, Any]) -> str:
       <div class="audit-heading">
         <div>
           <h2>Incomplete annotation details</h2>
-          <p>Completed Yes/No judgments that still need their required supporting details.</p>
+          <p>Current-matrix Yes/No judgments that still need their required supporting details.</p>
         </div>
         <div class="audit-summary">
           <span><b>{fmt_int(total_findings)}</b> findings</span>
@@ -1373,7 +1398,7 @@ def render_dashboard(
 
     annotation_activity_card = render_combined_activity_card(
         "Annotation progress",
-        "Overall completed canonical actions with today's new annotations shown alongside.",
+        "Completed actions from each person's current action × band matrix, with today's new annotations shown alongside.",
         stats["annotation_ranking"],
         today_ranking,
         "annotations",
@@ -1503,11 +1528,13 @@ tbody tr:hover td {{ background:#141d30; }}
 .combined-table th:nth-child(3),.combined-table td:nth-child(3),
 .combined-table th:nth-child(4),.combined-table td:nth-child(4) {{ width:92px; text-align:right; }}
 .combined-total {{ font-size:13px; }}
-.today-value {{ color:#c9f3df; font-weight:850; }}
+.today-value {{ font-weight:850; }}
+.today-positive {{ color:#8ee2b8; }}
+.today-zero {{ color:#ff7b7b; }}
 .combined-bar-row {{ grid-template-columns:minmax(110px,180px) 1fr 92px; }}
 .combined-bar-count {{ display:flex; justify-content:flex-end; gap:8px; align-items:baseline; }}
 .combined-bar-count b {{ color:#dce6fb; }}
-.today-inline {{ color:#8ee2b8; font-size:9px; }}
+.today-inline {{ font-size:9px; }}
 .quality-fill {{ background:linear-gradient(90deg,var(--orange),#ffe1a8); }}
 .quality-table th:nth-child(1),.quality-table td:nth-child(1) {{ width:66px; }}
 .quality-table th:nth-child(3),.quality-table td:nth-child(3),
@@ -1645,11 +1672,11 @@ footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
     <div class="method-grid">
       <div class="method-item">
         <b>One annotation = one canonical action</b>
-        <span>A canonical action counts once only when all five time bands are complete. In each band, yes requires a non-unset reason_judgment; no requires at least one rejection reason. Individual time-band judgments are not separate annotations.</span>
+        <span>An action counts once only when it is in that annotator's current action × band matrix and all five time bands are complete. Raw proposal-only actions do not count. In each band, yes requires a non-unset reason_judgment; no requires at least one rejection reason.</span>
       </div>
       <div class="method-item">
         <b>Fully annotated clip</b>
-        <span>Every action in the clip's canonical_action_pool must have a complete judgment for H10, H60, H30M, H1H, and H3H. For yes, reason_judgment must be set; for no, rejection_reasons must be non-empty.</span>
+        <span>Every action in that person's current action × band matrix must be complete for H10, H60, H30M, H1H, and H3H. The matrix is the intersection of the current canonical_action_pool and that annotator's canonical_actions. For yes, reason_judgment must be set; for no, rejection_reasons must be non-empty.</span>
       </div>
       <div class="method-item">
         <b>Today's annotations</b>
