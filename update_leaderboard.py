@@ -27,6 +27,10 @@ Counting rules:
     (H10, H60, H30M, H1H, H3H). The matrix is the intersection of the clip's current
     canonical_action_pool and that annotator's canonical_actions.
   - A proposal counts only when it has a non-empty reason and at least one associated fact_id.
+  - The incomplete-annotation audit checks every current canonical action once a
+    person has answered any band in that clip. It reports missing judgments,
+    entirely untouched actions, and Yes/No answers lacking supporting details.
+    Entirely untouched clips are not flagged.
   - Known model annotators and explicit exclusions are excluded from all human rankings.
 
 The script can download /api/export using the same .env credentials as the
@@ -416,34 +420,48 @@ def audit_missing_required_detail(judgment: dict[str, Any] | None) -> bool:
     return False
 
 
+def current_clip_audit_actions(
+    canonical_pool: list[dict[str, Any]],
+    matrix_actions: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Include *every* current canonical action when auditing a started clip.
+
+    Some exports omit untouched canonical actions from an annotator's
+    ``canonical_actions`` list entirely. Represent these as empty judgments so
+    they are still reported as incomplete once this annotator starts the clip.
+    This is audit-only: leaderboard completion counts remain unchanged.
+    """
+    annotated_by_id = {audit_canonical_id(action): action for action in matrix_actions}
+    audit_actions: list[dict[str, Any]] = []
+    seen_ids: set[str] = set()
+
+    for pool_action in canonical_pool:
+        canonical_id = audit_canonical_id(pool_action)
+        if not canonical_id or canonical_id in seen_ids:
+            continue
+        seen_ids.add(canonical_id)
+
+        annotated = annotated_by_id.get(canonical_id)
+        if annotated is None:
+            audit_actions.append({**pool_action, "horizon_judgments": {}})
+        else:
+            # Retain canonical-pool text as a fallback for sparsely saved rows.
+            audit_actions.append({**pool_action, **annotated})
+
+    return audit_actions
+
+
 def compress_audit_findings(
     row_number: int,
     matrix_actions: list[dict[str, Any]],
     affected: set[tuple[str, str]],
 ) -> list[dict[str, Any]]:
-    """Compress missing-detail findings for only the current matrix actions."""
+    """Compress incomplete judgments and actions into readable report rows."""
     if not matrix_actions or not affected:
         return []
 
-    action_by_id = {
-        audit_canonical_id(action): action
-        for action in matrix_actions
-        if audit_canonical_id(action)
-    }
-    all_cells = {
-        (canonical_id, horizon)
-        for canonical_id in action_by_id
-        for horizon in EXPECTED_HORIZONS
-    }
-
-    if affected == all_cells:
-        return [{
-            "row": row_number,
-            "ca": "ALL",
-            "action": "ALL",
-            "band": "ALL",
-        }]
-
+    # Keep one finding per affected canonical action at minimum. Collapsing an
+    # entire clip to CA=ALL would hide the untouched actions that need attention.
     findings: list[dict[str, Any]] = []
 
     for action in matrix_actions:
@@ -519,24 +537,28 @@ def analyse_missing_details(
                 continue
 
             matrix_actions = current_matrix_actions(canonical_pool, annotation)
-            if not matrix_actions:
+            # Do not report a completely untouched clip as incomplete. Once
+            # this annotator answers any band, however, audit *all* canonical
+            # actions, including those not saved in the annotator's matrix.
+            if not any(action_is_started(action) for action in matrix_actions):
                 continue
 
+            audit_actions = current_clip_audit_actions(canonical_pool, matrix_actions)
             affected: set[tuple[str, str]] = set()
 
-            for action in matrix_actions:
+            for action in audit_actions:
                 canonical_id = audit_canonical_id(action)
                 for horizon in EXPECTED_HORIZONS:
                     judgment = audit_judgment(action, horizon)
                     state = audit_judgment_state(judgment)
 
-                    if state in {"yes", "no"} and audit_missing_required_detail(judgment):
+                    if state == "unset" or audit_missing_required_detail(judgment):
                         affected.add((canonical_id, horizon))
 
             by_person[name].extend(
                 compress_audit_findings(
                     row_number=row_number,
-                    matrix_actions=matrix_actions,
+                    matrix_actions=audit_actions,
                     affected=affected,
                 )
             )
@@ -1214,8 +1236,8 @@ def render_compact_audit(audit: dict[str, Any]) -> str:
 
     if total_findings == 0:
         body = (
-            '<div class="audit-clear">✓ All completed Yes/No judgments '
-            'include their required details.</div>'
+            '<div class="audit-clear">✓ No unanswered bands, untouched actions, '
+            'or missing supporting details found in started clips.</div>'
         )
     else:
         people_html = []
@@ -1255,7 +1277,7 @@ def render_compact_audit(audit: dict[str, Any]) -> str:
       <div class="audit-heading">
         <div>
           <h2>Incomplete annotation details</h2>
-          <p>Current-matrix Yes/No judgments that still need their required supporting details.</p>
+          <p>After an annotator starts a clip: unanswered bands, untouched canonical actions, and Yes/No judgments missing required details.</p>
         </div>
         <div class="audit-summary">
           <span><b>{fmt_int(total_findings)}</b> findings</span>
