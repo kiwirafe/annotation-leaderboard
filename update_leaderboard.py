@@ -13,8 +13,9 @@ export does not reliably record the chronology of individual judgments.
 Confirmed duplicate groups are included in proposer provenance.
 
 Designed to run repeatedly (including via GitHub Actions). The review state is
-stored separately from the published HTML, and a repeated run never adds
-another credit for an already-attributed fourth judgment. The first run creates
+stored under docs/review_state by default, separately from the HTML file,
+and a repeated run never adds another credit for an already-attributed
+fourth judgment. The first run creates
 the three-voter baseline; previous fourth reviews cannot be inferred safely.
 Do not discard the review state between GitHub Actions runs.
 """
@@ -77,11 +78,16 @@ HORIZON_LABELS = {
     "H3H": "1–3 hours",
 }
 VALID_ACTION_JUDGMENTS = {"yes", "no"}
+# The reference leaderboard displays its update time in fixed AEST (UTC+10),
+# even when GitHub Actions runs on a UTC server.
+AEST = dt.timezone(dt.timedelta(hours=10), name="AEST")
+
 DEFAULT_REVIEW_TARGET = 700
 REVIEW_PROGRESS_FILENAME = "annotation_review_progress.json"
-# Kept outside the Pages output directory, so the review ledger is not public.
-# On ephemeral runners, pass this path explicitly and commit it between runs.
-DEFAULT_PROGRESS_STATE = Path("review_state") / REVIEW_PROGRESS_FILENAME
+# Stored under docs/review_state to persist alongside the GitHub Pages output.
+# WARNING: On a public Pages site, the JSON review ledger is publicly accessible.
+# On ephemeral runners, commit this file between scheduled runs.
+DEFAULT_PROGRESS_STATE = Path("docs") / "review_state" / REVIEW_PROGRESS_FILENAME
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
@@ -821,6 +827,13 @@ def badge(value: str, css_class: str = "") -> str:
     return f'<span class="badge {esc(css_class)}">{esc(value)}</span>'
 
 
+def stacked_annotator_badges(names: list[str]) -> str:
+    """Display each annotator on a separate line without widening the table."""
+    if not names:
+        return "—"
+    return '<div class="stacked-annotators">' + "".join(badge(name) for name in names) + '</div>'
+
+
 def render_two_yes_one_no_table(audit: dict[str, Any]) -> str:
     if not audit["rows"]:
         return '<div class="clear-box">✓ No strict 2 Yes / 1 No units found.</div>'
@@ -847,7 +860,7 @@ def render_two_yes_one_no_table(audit: dict[str, Any]) -> str:
             f'<div class="band-line">{esc(item["band"])}</div>'
             for item in row["disagreements"]
         )
-        annotators_html = " ".join(badge(name) for name in row["annotators"]) or "—"
+        annotators_html = stacked_annotator_badges(row["annotators"])
         proposers_html = " ".join(badge(name, "proposer") for name in row["proposers"]) or "—"
         eligible_html = " ".join(
             badge(name, "eligible") for name in row["eligible_reviewers"]
@@ -953,7 +966,7 @@ def render_self_annotation_table(audit: dict[str, Any]) -> str:
         return '<div class="clear-box">✓ No self-annotation/proposer overlap found.</div>'
     body = []
     for row in audit["rows"]:
-        annotators_html = " ".join(badge(name) for name in row.get("annotators", [])) or "—"
+        annotators_html = stacked_annotator_badges(row.get("annotators", []))
         body.append(
             "<tr>"
             f'<td class="num">{fmt_int(row["row"])}</td>'
@@ -980,7 +993,7 @@ def render_dashboard(
     excluded_annotators: set[str],
     explicit_ai_names: set[str],
 ) -> str:
-    generated = dt.datetime.now().astimezone()
+    updated_at_aest = dt.datetime.now(dt.timezone.utc).astimezone(AEST)
     people = ", ".join(self_audit["people"]) if self_audit["people"] else "none"
     exclusions = (
         f"Annotators: {', '.join(sorted(excluded_annotators)) or 'none'} · "
@@ -993,20 +1006,20 @@ def render_dashboard(
 :root{{--bg:#090d18;--panel:#111827;--text:#f4f7ff;--muted:#9aa8c5;--line:#28344e;--green:#67d89f;--red:#ff7f8c;--orange:#ffbd73;--purple:#bb91ff}}
 *{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;min-height:100vh;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -5%,rgba(83,119,255,.22),transparent 34rem),radial-gradient(circle at 92% 12%,rgba(255,127,140,.10),transparent 30rem),var(--bg)}}
 .container{{max-width:1560px;margin:0 auto;padding:30px 24px 64px}}.hero{{border:1px solid var(--line);border-radius:26px;padding:30px;background:linear-gradient(135deg,rgba(30,46,80,.98),rgba(16,24,41,.98));box-shadow:0 24px 70px rgba(0,0,0,.28)}}
-.eyebrow{{color:#b8c8eb;text-transform:uppercase;letter-spacing:.16em;font-size:11px;font-weight:800}}h1{{margin:8px 0 10px;font-size:clamp(32px,5vw,54px);letter-spacing:-.045em}}.hero-meta{{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:20px;color:#8fa2c7;font-size:12px}}.hero-meta b{{color:#dce6fb}}
+.eyebrow{{color:#b8c8eb;text-transform:uppercase;letter-spacing:.16em;font-size:11px;font-weight:800}}h1{{margin:8px 0 10px;font-size:clamp(32px,5vw,54px);letter-spacing:-.045em}}.hero-meta{{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:20px;color:#8fa2c7;font-size:12px}}.hero-meta b{{color:#dce6fb}}.mode-pill{{display:inline-block;padding:4px 9px;border:1px solid #42567e;border-radius:999px;background:#15233b;color:#dbe7ff;font-weight:800}}
 .panel{{margin-top:18px;border:1px solid var(--line);border-radius:21px;padding:20px;background:rgba(17,24,39,.95);box-shadow:0 14px 34px rgba(0,0,0,.16)}}.panel h2{{margin:0;font-size:20px}}.panel p{{margin:6px 0 14px;color:var(--muted);line-height:1.58;font-size:11px}}.section-one{{border-top:3px solid var(--orange)}}.section-two{{border-top:3px solid var(--purple)}}
-.summary-line{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 16px}}.summary-pill{{border:1px solid var(--line);border-radius:999px;background:#0d1422;color:#cbd8f1;padding:6px 10px;font-size:10px}}.table-wrap{{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:14px}}.audit-table{{width:100%;border-collapse:collapse;table-layout:auto;min-width:760px}}.audit-table th,.audit-table td{{padding:10px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;overflow-wrap:anywhere}}.audit-table th{{position:sticky;top:0;z-index:1;color:#95a8cc;background:#151e31;text-transform:uppercase;letter-spacing:.055em;font-size:9px}}.audit-table td{{color:#dce6fb;font-size:11px;line-height:1.45}}.audit-table tbody tr:last-child td{{border-bottom:0}}.audit-table tbody tr:hover td{{background:#141d30}}.disagreement-table{{min-width:1320px}}.disagreement-table th:first-child{{min-width:56px;white-space:nowrap}}.disagreement-table .annotators,.disagreement-table .proposers,.disagreement-table .eligible-reviewers{{min-width:160px;max-width:250px}}
+.summary-line{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 16px}}.summary-pill{{border:1px solid var(--line);border-radius:999px;background:#0d1422;color:#cbd8f1;padding:6px 10px;font-size:10px}}.table-wrap{{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:14px}}.audit-table{{width:100%;border-collapse:collapse;table-layout:auto;min-width:760px}}.audit-table th,.audit-table td{{padding:10px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;overflow-wrap:anywhere}}.audit-table th{{position:sticky;top:0;z-index:1;color:#95a8cc;background:#151e31;text-transform:uppercase;letter-spacing:.055em;font-size:9px}}.audit-table td{{color:#dce6fb;font-size:11px;line-height:1.45}}.audit-table tbody tr:last-child td{{border-bottom:0}}.audit-table tbody tr:hover td{{background:#141d30}}.disagreement-table{{min-width:1120px}}.disagreement-table th:first-child{{min-width:56px;white-space:nowrap}}.disagreement-table .annotators{{min-width:118px;width:150px;max-width:170px}}.disagreement-table .proposers,.disagreement-table .eligible-reviewers{{min-width:135px;max-width:195px}}
 .audit-table tr[hidden],.filter-empty[hidden]{{display:none}}.filter-toolbar{{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;margin:14px 0 16px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#0d1422}}.filter-toolbar label{{font-size:11px;font-weight:800;color:#dbe6fa}}.filter-toolbar select{{min-width:230px;max-width:100%;border:1px solid #425573;border-radius:9px;background:#1b2840;color:#f4f7ff;padding:8px 12px;font-size:12px;cursor:pointer}}.filter-toolbar select:focus-visible{{outline:2px solid #77afff;outline-offset:2px}}.filter-status{{font-size:11px;color:var(--muted);margin-left:auto}}.filter-empty{{margin-top:12px;padding:13px 15px;border:1px dashed var(--line);border-radius:12px;font-size:11px;color:#cbd8f1}}.num,.ca,.band,.person{{white-space:nowrap;font-weight:800}}.num{{text-align:right;font-variant-numeric:tabular-nums}}.action{{min-width:300px;max-width:520px}}.band-line{{white-space:nowrap;margin:1px 0}}.vote-line{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:3px 0}}.subband{{display:inline-block;min-width:112px;color:#9fb0cf;font-size:9px;font-weight:800}}
-.badge{{display:inline-block;margin:1px 4px 1px 0;padding:4px 8px;border-radius:999px;border:1px solid var(--line);background:#0d1422;color:#dce6fb;font-size:9px;font-weight:800}}.badge.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.08)}}.badge.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.08)}}.badge.direct{{color:#b8d1ff;border-color:#425f8e;background:rgba(120,167,255,.09)}}.badge.duplicate{{color:#dfcaff;border-color:#59477a;background:rgba(187,145,255,.09)}}.badge.proposer{{color:#c6b8fc;border-color:#514775;background:rgba(187,145,255,.08)}}.badge.eligible{{color:#a5e6ca;border-color:#326251;background:rgba(103,216,159,.07)}}.none-eligible{{color:#8695ae;font-style:italic}}.judgment{{display:inline-block;margin:2px 4px 2px 0;padding:4px 7px;border-radius:8px;border:1px solid var(--line);font-size:9px;white-space:nowrap}}.judgment.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.07)}}.judgment.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.07)}}
+.badge{{display:inline-block;margin:1px 4px 1px 0;padding:4px 8px;border-radius:999px;border:1px solid var(--line);background:#0d1422;color:#dce6fb;font-size:9px;font-weight:800}}.badge.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.08)}}.badge.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.08)}}.badge.direct{{color:#b8d1ff;border-color:#425f8e;background:rgba(120,167,255,.09)}}.badge.duplicate{{color:#dfcaff;border-color:#59477a;background:rgba(187,145,255,.09)}}.badge.proposer{{color:#c6b8fc;border-color:#514775;background:rgba(187,145,255,.08)}}.badge.eligible{{color:#a5e6ca;border-color:#326251;background:rgba(103,216,159,.07)}}.stacked-annotators{{display:flex;flex-direction:column;align-items:flex-start;gap:4px}}.stacked-annotators .badge{{display:block;margin:0;max-width:100%;white-space:normal;overflow-wrap:anywhere}}.none-eligible{{color:#8695ae;font-style:italic}}.judgment{{display:inline-block;margin:2px 4px 2px 0;padding:4px 7px;border-radius:8px;border:1px solid var(--line);font-size:9px;white-space:nowrap}}.judgment.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.07)}}.judgment.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.07)}}
 .review-progress{{border-top:3px solid #78a7ff}}.progress-heading{{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}}.progress-target{{color:#d9e6ff;border:1px solid #405778;background:#182742;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:800}}.progress-bars{{margin:18px 0 4px}}.progress-bar-row{{display:grid;grid-template-columns:minmax(145px,240px) minmax(100px,1fr) 108px;align-items:center;gap:14px;margin:14px 0}}.progress-person{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:700;color:#e1eafa}}.progress-track{{height:13px;border-radius:999px;overflow:hidden;background:#202b42}}.progress-fill{{height:100%;border-radius:999px;background:linear-gradient(90deg,#78a7ff,#62d6d2)}}.progress-count{{text-align:right;white-space:nowrap;color:#9eafcd;font-size:12px;font-variant-numeric:tabular-nums}}.progress-count b{{color:#e1eafa;font-size:14px}}.clear-box{{padding:13px 15px;border:1px dashed rgba(103,216,159,.34);border-radius:12px;color:#9be9bf;background:rgba(103,216,159,.035);font-size:11px}}.method-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:14px}}.method-item{{padding:14px;border-radius:14px;background:#0d1422;border:1px solid var(--line)}}.method-item b{{display:block;margin-bottom:5px;font-size:11px}}.method-item span{{color:var(--muted);font-size:10px;line-height:1.55}}code{{background:#0a1120;border:1px solid var(--line);border-radius:6px;padding:2px 5px}}footer{{margin-top:24px;text-align:center;color:#70809f;font-size:10px}}
 @media(max-width:1120px){{.method-grid{{grid-template-columns:1fr}}}}@media(max-width:700px){{.container{{padding:14px 10px 36px}}.hero,.panel{{padding:16px;border-radius:17px}}.progress-bar-row{{grid-template-columns:minmax(100px,145px) minmax(70px,1fr) 79px;gap:7px}}.progress-person{{font-size:10px}}.progress-count{{font-size:10px}}.progress-count b{{font-size:11px}}}}
 </style></head><body><div class="container">
-<section class="hero"><div class="eyebrow">Temporal NoRA · annotation audit</div><h1>Annotation Conflict Audit</h1><div class="hero-meta"><span><b>Generated:</b> {esc(generated.strftime("%d %B %Y, %I:%M %p %Z").lstrip("0"))}</span></div></section>
+<section class="hero"><div class="eyebrow">Temporal NoRA · annotation audit</div><h1>Annotation Conflict Audit</h1><div class="hero-meta"><span class="mode-pill"><b>Last Updated:</b> {esc(updated_at_aest.strftime("%d %B %Y, %I:%M %p AEST").lstrip("0"))}</span></div></section>
 {render_review_progress_chart(review_progress)}
 <section class="panel section-one"><h2>2 Yes + 1 No disagreements</h2>{render_two_yes_one_no_table(two_one)}</section>
 <section class="panel section-two"><h2>Annotator rated their own proposed action</h2><p>A finding requires at least one valid Yes/No judgment by the same included human who proposed the action. The table also lists everyone who supplied at least one valid Yes/No judgment on that action. Confirmed duplicate groups are expanded so a proposal remains attributable to its original proposer even when another proposal is selected as the representative canonical action.</p><div class="summary-line"><span class="summary-pill"><b>{fmt_int(self_audit["events"])}</b> self-annotation events</span><span class="summary-pill"><b>{fmt_int(self_audit["affected_actions"])}</b> affected canonical actions</span><span class="summary-pill"><b>{fmt_int(len(self_audit["people"]))}</b> people</span><span class="summary-pill"><b>People:</b> {esc(people)}</span></div>{render_self_annotation_table(self_audit)}</section>
 <section class="panel"><h2>Method & filters</h2><div class="method-grid"><div class="method-item"><b>Human-only audit</b><span>Known/common model names are excluded. Explicit model names: {esc(", ".join(sorted(explicit_ai_names, key=str.casefold)) or "none")}.</span></div><div class="method-item"><b>Default exclusions</b><span>{esc(exclusions)}. Use <code>--include-default-exclusions</code> to disable the built-in Ning/API-Test exclusions.</span></div><div class="method-item"><b>Proposal provenance & reviewer roster</b><span>Canonical <code>proposal_ids</code> are expanded only through <code>confirmed</code> duplicate groups. The six reviewers are listed in <code>DEFAULT_REVIEWERS</code>; use <code>--reviewer NAME</code> (repeatable) to override the roster.</span></div></div></section>
-<footer>Generated by annotation_conflict_audit.py · self-contained HTML</footer></div>{REVIEWER_FILTER_SCRIPT}</body></html>'''
+<footer>Annotation Conflict Audit · self-contained HTML</footer></div>{REVIEWER_FILTER_SCRIPT}</body></html>'''
 
 
 def parse_args() -> argparse.Namespace:
