@@ -13,12 +13,13 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  TARGET_CLIPS: '95'
-  IGNORE_INCOMPLETE_PROPOSAL_CLIPS: '1-30'
+  REVIEW_TARGET_UNITS: '700'
+  REVIEW_STATE: review_state/annotation_review_progress.json
 
 jobs:
   update-and-deploy:
     runs-on: ubuntu-latest
+    timeout-minutes: 18
 
     environment:
       name: github-pages
@@ -31,29 +32,45 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Generate dashboard and progress JSON
+      - name: Generate conflict audit and update reviewer progress
         env:
           ANNOTATION_SITE_PASSWORD: ${{ secrets.ANNOTATION_SITE_PASSWORD }}
           ANNOTATION_ADMIN_PASSWORD: ${{ secrets.ANNOTATION_ADMIN_PASSWORD }}
         run: |
-          mkdir -p docs/progress_json
-          python3 update_leaderboard.py \
-            --target-clips "$TARGET_CLIPS" \
-            --output docs/index.html \
-            --progress-json-dir docs/progress_json
+          set -euo pipefail
+          mkdir -p docs review_state
 
-      - name: Persist progress JSON history
+          # Never silently reset historical progress if its committed file vanished.
+          if [[ ! -f "$REVIEW_STATE" ]] && \
+             [[ -n "$(git log -1 --format=%H -- "$REVIEW_STATE")" ]]; then
+            echo "Review progress was previously committed but is now missing. Refusing to reset it." >&2
+            exit 1
+          fi
+
+          # Keep the raw export in the runner's temporary directory, not the repo.
+          umask 077
+          python3 update_leaderboard.py \
+            --export-path "$RUNNER_TEMP/annotation_export.jsonl" \
+            --output docs/index.html \
+            --progress-state "$REVIEW_STATE" \
+            --review-target "$REVIEW_TARGET_UNITS"
+
+          test -s docs/index.html
+          test -s "$REVIEW_STATE"
+
+      - name: Persist adjudication progress
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add docs/progress_json/
-
+          # Commit only the review ledger; never commit raw exports or secrets.
+          git add -- "$REVIEW_STATE"
           if git diff --cached --quiet; then
-            echo "No new progress JSON snapshot to commit."
+            echo "No change to adjudication progress."
           else
-            git commit -m "chore: save annotation progress"
-            git push origin HEAD:${{ github.event.repository.default_branch }}
+            git commit -m "chore: save adjudication review progress"
+            git push origin "HEAD:${{ github.event.repository.default_branch }}"
           fi
 
       - name: Configure GitHub Pages

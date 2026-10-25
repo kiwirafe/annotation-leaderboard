@@ -1,42 +1,22 @@
 #!/usr/bin/env python3
-"""Generate a self-contained HTML leaderboard for Temporal NoRA annotation progress.
+"""Generate a self-contained HTML audit for Temporal NoRA annotations.
 
-The dashboard focuses on four human contribution views:
-  1. Most canonical-action annotations overall
-  2. Most fully annotated clips, measured against a configurable per-person target
-  3. Most canonical-action annotations added during the current NSW local day
-  4. Most human action proposals
+Audits:
+1. Strict 2 Yes + 1 No disagreement at (clip, canonical action, time band).
+   Shows existing annotators, original proposers and eligible independent reviewers.
+2. Human annotator judging a canonical action derived from their own proposal.
 
-Output/history behaviour:
-  - The current dashboard is overwritten on every run.
-  - Every run also writes one compact JSON progress snapshot. Its filename contains
-    the NSW local hour, while its body contains ONLY the three per-person counters needed
-    for history: actions annotated, clips fully annotated, and proposals.
-  - "Actions annotated today" is calculated from the earliest saved progress JSON
-    snapshot for the current NSW local date. This does not depend on annotation timestamps,
-    which are not present in the current export structure.
+The self-contained report filters open disagreements by eligible reviewer and
+tracks independently reviewed time-band units toward a per-person target.
+Review attribution is based on a persistent pre-review snapshot, because the
+export does not reliably record the chronology of individual judgments.
+Confirmed duplicate groups are included in proposer provenance.
 
-Counting rules:
-  - One annotation = one canonical action with complete judgments for all five expected
-    horizons. For each horizon:
-      * action_judgment == "yes" requires reason_judgment to be present and not "unset";
-      * action_judgment == "no" requires rejection_reasons to be non-empty.
-    Individual horizon judgments are not separate annotations.
-  - A clip is fully annotated by a person only when every action in that person's
-    current action × band matrix has a complete judgment for all five expected horizons
-    (H10, H60, H30M, H1H, H3H). The matrix is the intersection of the clip's current
-    canonical_action_pool and that annotator's canonical_actions.
-  - A proposal counts only when it has a non-empty reason and at least one associated fact_id.
-  - The incomplete-annotation audit checks every current canonical action once a
-    person has answered any band in that clip. It reports missing judgments,
-    entirely untouched actions, and Yes/No answers lacking supporting details.
-    Entirely untouched clips are not flagged.
-  - Known model annotators and explicit exclusions are excluded from all human rankings.
-
-The script can download /api/export using the same .env credentials as the
-Temporal NoRA annotation pipeline, or analyse an existing JSON/JSONL export.
-
-No third-party Python packages are required.
+Designed to run repeatedly (including via GitHub Actions). The review state is
+stored separately from the published HTML, and a repeated run never adds
+another credit for an already-attributed fourth judgment. The first run creates
+the three-voter baseline; previous fourth reviews cannot be inferred safely.
+Do not discard the review state between GitHub Actions runs.
 """
 
 from __future__ import annotations
@@ -54,17 +34,11 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
-from zoneinfo import ZoneInfo
-
 
 DEFAULT_URL = "https://annotation.rainsproj.com"
 DEFAULT_ANNOTATOR = "VLM Annotator"
 DEFAULT_EXPORT = Path("inputs/annotation_export.jsonl")
-DEFAULT_OUTPUT = Path("reports/annotation_leaderboard.html")
-DEFAULT_TARGET_CLIPS = 10
-
-# NSW local time, including automatic daylight-saving transitions (AEST/AEDT).
-NSW_TZ = ZoneInfo("Australia/Sydney")
+DEFAULT_OUTPUT = Path("reports/annotation_conflict.html")
 
 REQUEST_HEADERS = {
     "Accept": "application/json",
@@ -75,29 +49,23 @@ REQUEST_HEADERS = {
     ),
 }
 
-KNOWN_AI_ANNOTATORS = {
-    "Claude-Opus-5",
-    "GPT-5.6-Sol",
-}
-
-# Excluded from every statistic, leaderboard, target, and daily delta.
-DEFAULT_EXCLUDED_CLIP_IDS = {
-    "API-Test-Clip190",
-}
-DEFAULT_EXCLUDED_ANNOTATORS = {
-    "Ning",
-    "API-Test-Clip190",
-}
+KNOWN_AI_ANNOTATORS = {"Claude-Opus-5", "GPT-5.6-Sol"}
 AI_NAME_HINTS = (
-    "gpt",
-    "claude",
-    "openai",
-    "anthropic",
-    "gemini",
-    "llama",
-    "qwen",
-    "deepseek",
-    "mistral",
+    "gpt", "claude", "openai", "anthropic", "gemini",
+    "llama", "qwen", "deepseek", "mistral",
+)
+DEFAULT_EXCLUDED_CLIP_IDS = {"API-Test-Clip190"}
+DEFAULT_EXCLUDED_ANNOTATORS = {"Ning", "API-Test-Clip190"}
+
+# Project's six human reviewers; all appear as filter options even with no eligible actions.
+# Change this tuple, or pass --reviewer multiple times, if team membership changes.
+DEFAULT_REVIEWERS = (
+    "Hanyu",
+    "Jiayang Wang",
+    "Khai",
+    "Naman Kansal",
+    "Ngakan Putu Bagus Aditya",
+    "Shantelle So",
 )
 
 EXPECTED_HORIZONS = ("H10", "H60", "H30M", "H1H", "H3H")
@@ -108,7 +76,12 @@ HORIZON_LABELS = {
     "H1H": "30 minutes–1 hour",
     "H3H": "1–3 hours",
 }
-PROGRESS_JSON_PREFIX = "annotation_progress"
+VALID_ACTION_JUDGMENTS = {"yes", "no"}
+DEFAULT_REVIEW_TARGET = 700
+REVIEW_PROGRESS_FILENAME = "annotation_review_progress.json"
+# Kept outside the Pages output directory, so the review ledger is not public.
+# On ephemeral runners, pass this path explicitly and commit it between runs.
+DEFAULT_PROGRESS_STATE = Path("review_state") / REVIEW_PROGRESS_FILENAME
 
 
 def eprint(*args: Any, **kwargs: Any) -> None:
@@ -116,10 +89,8 @@ def eprint(*args: Any, **kwargs: Any) -> None:
 
 
 def load_simple_dotenv(path: Path) -> None:
-    """Load ordinary KEY=VALUE entries without requiring python-dotenv."""
     if not path.is_file():
         return
-
     for raw_line in path.read_text(encoding="utf-8-sig").splitlines():
         line = raw_line.strip()
         if not line or line.startswith("#"):
@@ -128,10 +99,8 @@ def load_simple_dotenv(path: Path) -> None:
             line = line[7:].lstrip()
         if "=" not in line:
             continue
-
         key, value = line.split("=", 1)
-        key = key.strip()
-        value = value.strip()
+        key, value = key.strip(), value.strip()
         if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key):
             continue
         if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
@@ -149,10 +118,7 @@ def load_project_env() -> None:
             load_simple_dotenv(candidate)
 
 
-def make_authenticated_opener(
-    base_url: str,
-    annotator: str,
-) -> urllib.request.OpenerDirector:
+def make_authenticated_opener(base_url: str, annotator: str) -> urllib.request.OpenerDirector:
     site_password = os.getenv("ANNOTATION_SITE_PASSWORD")
     admin_password = os.getenv("ANNOTATION_ADMIN_PASSWORD")
     if not site_password or not admin_password:
@@ -175,10 +141,7 @@ def make_authenticated_opener(
         with opener.open(request, timeout=90) as response:
             response.read()
 
-    post_json(
-        "/api/auth/login",
-        {"annotatorName": annotator, "password": site_password},
-    )
+    post_json("/api/auth/login", {"annotatorName": annotator, "password": site_password})
     post_json("/api/admin/login", {"password": admin_password})
     return opener
 
@@ -186,8 +149,6 @@ def make_authenticated_opener(
 def download_export(args: argparse.Namespace) -> Path:
     output_path: Path = args.export_path
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    output_path.unlink(missing_ok=True)
-
     print("\n=== DOWNLOAD EXPORT ===")
     print(f"GET {args.url.rstrip('/')}/api/export")
     print(f"-> {output_path}")
@@ -198,28 +159,24 @@ def download_export(args: argparse.Namespace) -> Path:
         headers=REQUEST_HEADERS,
         method="GET",
     )
-
     temp_path = output_path.with_suffix(output_path.suffix + ".part")
     try:
         with opener.open(request, timeout=180) as response, temp_path.open("wb") as output:
             while chunk := response.read(1024 * 1024):
                 output.write(chunk)
-        if temp_path.stat().st_size == 0:
+        if not temp_path.exists() or temp_path.stat().st_size == 0:
             raise ValueError("Website export was empty")
         temp_path.replace(output_path)
     finally:
         temp_path.unlink(missing_ok=True)
-
     print(f"Downloaded {output_path.stat().st_size:,} bytes")
     return output_path
 
 
 def load_export_records(path: Path) -> list[dict[str, Any]]:
-    """Read JSONL, one JSON object, or a JSON array of objects."""
     text = path.read_text(encoding="utf-8-sig").strip()
     if not text:
         raise ValueError(f"Export is empty: {path}")
-
     try:
         value = json.loads(text)
     except json.JSONDecodeError:
@@ -236,7 +193,6 @@ def load_export_records(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"JSONL line {line_number} is not an object")
             records.append(item)
         return records
-
     if isinstance(value, dict):
         return [value]
     if isinstance(value, list) and all(isinstance(item, dict) for item in value):
@@ -256,125 +212,19 @@ def is_ai_annotator(name: str, explicit_ai_names: set[str]) -> bool:
 
 
 def is_excluded(value: str, excluded_values: set[str]) -> bool:
-    """Case-insensitive exact-match exclusion."""
     folded = value.casefold()
     return any(folded == excluded.casefold() for excluded in excluded_values)
 
 
-def horizon_judgment_is_complete(judgment: Any) -> bool:
-    """Return True only when an action judgment has its required follow-up data.
-
-    Rules:
-      - yes -> reason_judgment must be present and not "unset"
-      - no  -> rejection_reasons must contain at least one non-empty reason
-    """
-    if not isinstance(judgment, dict):
-        return False
-
-    action_judgment = str(judgment.get("action_judgment") or "").strip().casefold()
-    if action_judgment == "yes":
-        reason_judgment = str(judgment.get("reason_judgment") or "").strip().casefold()
-        return bool(reason_judgment) and reason_judgment != "unset"
-
-    if action_judgment == "no":
-        rejection_reasons = judgment.get("rejection_reasons")
-        if not isinstance(rejection_reasons, (list, tuple, set)):
-            return False
-        return any(str(reason).strip() for reason in rejection_reasons)
-
-    return False
+def canonical_id(item: dict[str, Any]) -> str:
+    value = item.get("canonical_action_id")
+    return str(value).strip() if value is not None else ""
 
 
-def action_is_started(action: dict[str, Any]) -> bool:
-    """Return True when at least one horizon has an actual yes/no judgment."""
-    judgments = action.get("horizon_judgments") or {}
-    if not isinstance(judgments, dict):
-        return False
-
-    return any(
-        str((judgment or {}).get("action_judgment") or "").strip().casefold()
-        in {"yes", "no"}
-        for judgment in judgments.values()
-        if isinstance(judgment, dict)
-    )
-
-
-def action_is_complete(action: dict[str, Any]) -> bool:
-    """Return True when all five expected horizons have complete judgments."""
-    judgments = action.get("horizon_judgments") or {}
-    if not isinstance(judgments, dict):
-        return False
-    return all(
-        horizon_judgment_is_complete(judgments.get(horizon))
-        for horizon in EXPECTED_HORIZONS
-    )
-
-
-def current_matrix_actions(
-    canonical_pool: list[Any],
-    annotation: dict[str, Any],
-) -> list[dict[str, Any]]:
-    """Return this annotator's actions that are still in the current action × band matrix.
-
-    The current matrix is the intersection of:
-      1. canonical_action_pool for the clip (the current clip-level canonical set), and
-      2. annotation.canonical_actions for this annotator (the rows actually present in
-         that annotator's matrix).
-
-    Raw proposal entries are deliberately not consulted here.
-    """
-    pool_ids = {
-        str(item.get("canonical_action_id")).strip()
-        for item in canonical_pool
-        if isinstance(item, dict) and item.get("canonical_action_id") is not None
-    }
-    pool_ids.discard("")
-    if not pool_ids:
-        return []
-
-    actions = annotation.get("canonical_actions") or []
-    if not isinstance(actions, list):
-        return []
-
-    matrix_actions: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
-    for action in actions:
-        if not isinstance(action, dict):
-            continue
-        canonical_id = audit_canonical_id(action)
-        if not canonical_id or canonical_id not in pool_ids or canonical_id in seen_ids:
-            continue
-        matrix_actions.append(action)
-        seen_ids.add(canonical_id)
-
-    return matrix_actions
-
-
-def clip_is_fully_annotated(matrix_actions: list[dict[str, Any]]) -> bool:
-    """Return True when every action in this annotator's current matrix is complete."""
-    return bool(matrix_actions) and all(action_is_complete(action) for action in matrix_actions)
-
-def proposal_is_complete(proposal: dict[str, Any]) -> bool:
-    """Return True only when a proposal has a reason and at least one associated fact."""
-    reason = str(proposal.get("reason") or "").strip()
-    fact_ids = proposal.get("fact_ids")
-
-    return (
-        bool(reason)
-        and isinstance(fact_ids, (list, tuple, set))
-        and any(str(fact_id).strip() for fact_id in fact_ids)
-    )
-
-
-def audit_action_text(item: dict[str, Any]) -> str:
+def action_text(item: dict[str, Any]) -> str:
     for key in (
-        "canonical_action",
-        "action",
-        "action_text",
-        "text",
-        "description",
-        "representative_action",
-        "canonical_text",
+        "action", "canonical_action", "action_text", "text",
+        "description", "representative_action", "canonical_text",
     ):
         value = item.get(key)
         if isinstance(value, str) and value.strip():
@@ -382,571 +232,578 @@ def audit_action_text(item: dict[str, Any]) -> str:
     return "(action text unavailable)"
 
 
-def audit_canonical_id(item: dict[str, Any]) -> str:
-    value = item.get("canonical_action_id")
-    return str(value).strip() if value is not None else ""
-
-
-def audit_judgment(action: dict[str, Any] | None, horizon: str) -> dict[str, Any] | None:
-    if not isinstance(action, dict):
-        return None
-    judgments = action.get("horizon_judgments")
-    if not isinstance(judgments, dict):
-        return None
-    value = judgments.get(horizon)
-    return value if isinstance(value, dict) else None
-
-
-def audit_judgment_state(judgment: dict[str, Any] | None) -> str:
+def valid_binary_judgment(judgment: Any) -> str | None:
     if not isinstance(judgment, dict):
-        return "unset"
+        return None
     value = str(judgment.get("action_judgment") or "").strip().casefold()
-    return value if value in {"yes", "no"} else "unset"
+    return value if value in VALID_ACTION_JUDGMENTS else None
 
 
-def audit_missing_required_detail(judgment: dict[str, Any] | None) -> bool:
-    state = audit_judgment_state(judgment)
+def completed_horizon_judgment(judgment: Any) -> bool:
+    """Require the same complete Yes/No evidence as the annotation leaderboard.
 
+    A Yes must have a non-unset reason_judgment; a No must include at least
+    one rejection reason. Merely setting Yes/No does not complete a review.
+    """
+    state = valid_binary_judgment(judgment)
     if state == "yes":
-        reason = str((judgment or {}).get("reason_judgment") or "").strip().casefold()
-        return not reason or reason == "unset"
-
+        reason = str(judgment.get("reason_judgment") or "").strip().casefold()
+        return bool(reason) and reason != "unset"
     if state == "no":
-        reasons = (judgment or {}).get("rejection_reasons")
-        if not isinstance(reasons, (list, tuple, set)):
-            return True
-        return not any(str(reason).strip() for reason in reasons)
-
+        reasons = judgment.get("rejection_reasons")
+        return isinstance(reasons, (list, tuple, set)) and any(
+            str(reason).strip() for reason in reasons
+        )
     return False
 
 
-def current_clip_audit_actions(
-    canonical_pool: list[dict[str, Any]],
-    matrix_actions: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    """Include *every* current canonical action when auditing a started clip.
+def rejection_reason_text(judgment: Any) -> str:
+    if not isinstance(judgment, dict):
+        return "—"
+    reasons = judgment.get("rejection_reasons")
+    if not isinstance(reasons, (list, tuple, set)):
+        return "—"
+    cleaned = [str(reason).strip() for reason in reasons if str(reason).strip()]
+    return ", ".join(cleaned) if cleaned else "—"
 
-    Some exports omit untouched canonical actions from an annotator's
-    ``canonical_actions`` list entirely. Represent these as empty judgments so
-    they are still reported as incomplete once this annotator starts the clip.
-    This is audit-only: leaderboard completion counts remain unchanged.
+
+def proposal_id_set(item: dict[str, Any]) -> set[str]:
+    raw = item.get("proposal_ids")
+    if not isinstance(raw, (list, tuple, set)):
+        return set()
+    return {str(value).strip() for value in raw if str(value).strip()}
+
+
+def build_duplicate_expansion(
+    duplicate_groups: list[Any],
+) -> tuple[dict[str, set[str]], dict[str, str]]:
+    """Expand confirmed groups from original/representative/merged IDs."""
+    expansion: dict[str, set[str]] = {}
+    group_name_by_seed: dict[str, str] = {}
+    for raw_group in duplicate_groups:
+        if not isinstance(raw_group, dict):
+            continue
+        if str(raw_group.get("status") or "").strip().casefold() != "confirmed":
+            continue
+        members = {
+            str(value).strip()
+            for value in (raw_group.get("proposal_ids") or [])
+            if str(value).strip()
+        }
+        if not members:
+            continue
+        seeds = set(members)
+        for key in ("representative_proposal_id", "merged_proposal_id"):
+            value = str(raw_group.get(key) or "").strip()
+            if value:
+                seeds.add(value)
+        group_label = (
+            str(raw_group.get("name") or "").strip()
+            or str(raw_group.get("group_id") or "").strip()
+            or "confirmed duplicate group"
+        )
+        for seed in seeds:
+            expansion.setdefault(seed, set()).update(members)
+            group_name_by_seed[seed] = group_label
+    return expansion, group_name_by_seed
+
+
+def expand_canonical_proposal_ids(
+    canonical_proposal_ids: set[str],
+    duplicate_expansion: dict[str, set[str]],
+) -> set[str]:
+    expanded = set(canonical_proposal_ids)
+    while True:
+        before = len(expanded)
+        for proposal_id in list(expanded):
+            expanded.update(duplicate_expansion.get(proposal_id, set()))
+        if len(expanded) == before:
+            return expanded
+
+
+def build_canonical_provenance(record: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Map canonical actions to *all* original proposals, including confirmed merges.
+
+    This shared provenance is used by both the disagreement reviewer eligibility
+    check and the existing self-annotation check.
     """
-    annotated_by_id = {audit_canonical_id(action): action for action in matrix_actions}
-    audit_actions: list[dict[str, Any]] = []
-    seen_ids: set[str] = set()
+    proposals = record.get("proposals") or []
+    proposal_by_id = {
+        str(proposal.get("proposal_id") or "").strip(): proposal
+        for proposal in proposals if isinstance(proposal, dict)
+        and str(proposal.get("proposal_id") or "").strip()
+    } if isinstance(proposals, list) else {}
+    duplicate_groups = record.get("duplicate_groups") or []
+    expansion, _ = build_duplicate_expansion(
+        duplicate_groups if isinstance(duplicate_groups, list) else []
+    )
+    pool = record.get("canonical_action_pool") or []
+    provenance: dict[str, dict[str, Any]] = {}
+    if not isinstance(pool, list):
+        return provenance
 
-    for pool_action in canonical_pool:
-        canonical_id = audit_canonical_id(pool_action)
-        if not canonical_id or canonical_id in seen_ids:
+    for item in pool:
+        if not isinstance(item, dict):
             continue
-        seen_ids.add(canonical_id)
-
-        annotated = annotated_by_id.get(canonical_id)
-        if annotated is None:
-            audit_actions.append({**pool_action, "horizon_judgments": {}})
-        else:
-            # Retain canonical-pool text as a fallback for sparsely saved rows.
-            audit_actions.append({**pool_action, **annotated})
-
-    return audit_actions
-
-
-def compress_audit_findings(
-    row_number: int,
-    matrix_actions: list[dict[str, Any]],
-    affected: set[tuple[str, str]],
-) -> list[dict[str, Any]]:
-    """Compress incomplete judgments and actions into readable report rows."""
-    if not matrix_actions or not affected:
-        return []
-
-    # Keep one finding per affected canonical action at minimum. Collapsing an
-    # entire clip to CA=ALL would hide the untouched actions that need attention.
-    findings: list[dict[str, Any]] = []
-
-    for action in matrix_actions:
-        canonical_id = audit_canonical_id(action)
-        if not canonical_id:
+        cid = canonical_id(item)
+        if not cid:
             continue
-
-        affected_horizons = [
-            horizon
-            for horizon in EXPECTED_HORIZONS
-            if (canonical_id, horizon) in affected
-        ]
-        if not affected_horizons:
-            continue
-
-        action_text = audit_action_text(action)
-
-        if len(affected_horizons) == len(EXPECTED_HORIZONS):
-            findings.append({
-                "row": row_number,
-                "ca": canonical_id,
-                "action": action_text,
-                "band": "ALL",
-            })
-            continue
-
-        for horizon in affected_horizons:
-            findings.append({
-                "row": row_number,
-                "ca": canonical_id,
-                "action": action_text,
-                "band": HORIZON_LABELS.get(horizon, horizon),
-            })
-
-    return findings
+        proposal_ids = expand_canonical_proposal_ids(proposal_id_set(item), expansion)
+        proposals_by_person: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+        for proposal_id in sorted(proposal_ids):
+            proposal = proposal_by_id.get(proposal_id)
+            if proposal is not None:
+                proposals_by_person[normalize_name(proposal.get("annotator_id"))].append(proposal)
+        provenance[cid] = {
+            "pool_item": item,
+            "proposals_by_person": proposals_by_person,
+            "proposers": sorted(proposals_by_person, key=str.casefold),
+        }
+    return provenance
 
 
-
-def analyse_missing_details(
+def analyse_two_yes_one_no(
     records: list[dict[str, Any]],
     *,
     start_row: int,
     explicit_ai_names: set[str],
     excluded_clip_ids: set[str],
     excluded_annotators: set[str],
+    reviewers: tuple[str, ...] = DEFAULT_REVIEWERS,
 ) -> dict[str, Any]:
-    by_person: dict[str, list[dict[str, Any]]] = collections.defaultdict(list)
+    """Find strict 2 Yes / 1 No units and eligible reviewers for each action.
 
-    for original_index, record in enumerate(records, start=start_row):
-        row_number = original_index + 1
+    A reviewer is eligible only if they have never submitted a valid Yes/No
+    judgment on *any band of that canonical action*, and are not among the
+    original proposers, including contributors to confirmed duplicate groups.
+    """
+    unit_rows: list[dict[str, Any]] = []
+    tracking_units: list[dict[str, Any]] = []
+    conflicting_duplicate_ratings = 0
+
+    for local_index, record in enumerate(records):
+        row_number = start_row + local_index + 1
         clip_id = normalize_name(record.get("clip_id"))
-
         if is_excluded(clip_id, excluded_clip_ids):
             continue
 
-        pool_raw = record.get("canonical_action_pool") or []
-        canonical_pool = [
-            item for item in pool_raw if isinstance(item, dict)
-        ] if isinstance(pool_raw, list) else []
+        provenance = build_canonical_provenance(record)
+        pool_map = {cid: info["pool_item"] for cid, info in provenance.items()}
+        values: dict[tuple[str, str], dict[str, set[str]]] = collections.defaultdict(
+            lambda: collections.defaultdict(set)
+        )
+        action_annotators: dict[str, set[str]] = collections.defaultdict(set)
 
-        if not canonical_pool:
-            continue
-
-        for annotation in record.get("annotations") or []:
+        annotations = record.get("annotations") or []
+        if not isinstance(annotations, list):
+            annotations = []
+        for annotation in annotations:
             if not isinstance(annotation, dict):
                 continue
-
             name = normalize_name(annotation.get("annotator_id"))
-
-            if is_excluded(name, excluded_annotators):
+            if is_excluded(name, excluded_annotators) or is_ai_annotator(name, explicit_ai_names):
                 continue
-            if is_ai_annotator(name, explicit_ai_names):
+            actions = annotation.get("canonical_actions") or []
+            if not isinstance(actions, list):
                 continue
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                cid = canonical_id(action)
+                if cid not in pool_map:
+                    continue
+                judgments = action.get("horizon_judgments") or {}
+                if not isinstance(judgments, dict):
+                    continue
+                for horizon, judgment in judgments.items():
+                    state = valid_binary_judgment(judgment)
+                    if state is None:
+                        continue
+                    values[(cid, str(horizon))][name].add(state)
+                    action_annotators[cid].add(name)
 
-            matrix_actions = current_matrix_actions(canonical_pool, annotation)
-            # Do not report a completely untouched clip as incomplete. Once
-            # this annotator answers any band, however, audit *all* canonical
-            # actions, including those not saved in the annotator's matrix.
-            if not any(action_is_started(action) for action in matrix_actions):
+        for (cid, horizon), annotator_values in values.items():
+            clean: dict[str, str] = {}
+            for name, states in annotator_values.items():
+                if len(states) == 1:
+                    clean[name] = next(iter(states))
+                else:
+                    conflicting_duplicate_ratings += 1
+            if len(clean) != 3:
                 continue
-
-            audit_actions = current_clip_audit_actions(canonical_pool, matrix_actions)
-            affected: set[tuple[str, str]] = set()
-
-            for action in audit_actions:
-                canonical_id = audit_canonical_id(action)
-                for horizon in EXPECTED_HORIZONS:
-                    judgment = audit_judgment(action, horizon)
-                    state = audit_judgment_state(judgment)
-
-                    if state == "unset" or audit_missing_required_detail(judgment):
-                        affected.add((canonical_id, horizon))
-
-            by_person[name].extend(
-                compress_audit_findings(
-                    row_number=row_number,
-                    matrix_actions=audit_actions,
-                    affected=affected,
-                )
-            )
-
-    issue_people = {
-        name: findings
-        for name, findings in sorted(
-            by_person.items(),
-            key=lambda item: item[0].casefold(),
-        )
-        if findings
-    }
-
-    return {
-        "by_person": issue_people,
-        "total_findings": sum(len(findings) for findings in issue_people.values()),
-        "people_affected": len(issue_people),
-    }
-
-
-
-def parse_number_ranges(value: str) -> set[int]:
-    """Parse clip numbers/ranges such as ``1-30, 38, 50-70``.
-
-    Clip numbers are the 1-based row numbers shown in the proposal-details table.
-    Whitespace is ignored. Overlapping ranges and duplicate numbers are harmless.
-    """
-    value = str(value or "").strip()
-    if not value:
-        return set()
-
-    numbers: set[int] = set()
-    for raw_part in value.split(","):
-        part = raw_part.strip()
-        if not part:
-            continue
-
-        match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
-        if match:
-            start = int(match.group(1))
-            end = int(match.group(2))
-            if start <= 0 or end <= 0:
-                raise ValueError("clip numbers must be >= 1")
-            if start > end:
-                raise ValueError(f"invalid clip range {part!r}: start is greater than end")
-            numbers.update(range(start, end + 1))
-            continue
-
-        if re.fullmatch(r"\d+", part):
-            number = int(part)
-            if number <= 0:
-                raise ValueError("clip numbers must be >= 1")
-            numbers.add(number)
-            continue
-
-        raise ValueError(
-            f"invalid clip/range {part!r}; expected values like '1-30, 38, 50-70'"
-        )
-
-    return numbers
-
-
-def compress_number_ranges(numbers: list[int]) -> str:
-    numbers = sorted(set(numbers))
-    if not numbers:
-        return ""
-
-    ranges: list[str] = []
-    start = previous = numbers[0]
-
-    for number in numbers[1:]:
-        if number == previous + 1:
-            previous = number
-            continue
-        ranges.append(
-            str(start) if start == previous else f"{start}-{previous}"
-        )
-        start = previous = number
-
-    ranges.append(
-        str(start) if start == previous else f"{start}-{previous}"
-    )
-    return ", ".join(ranges)
-
-
-def analyse_proposal_details(
-    records: list[dict[str, Any]],
-    *,
-    start_row: int,
-    explicit_ai_names: set[str],
-    excluded_clip_ids: set[str],
-    excluded_annotators: set[str],
-    ignored_incomplete_clip_numbers: set[int],
-) -> dict[str, Any]:
-    by_person: dict[str, dict[int, list[dict[str, Any]]]] = collections.defaultdict(
-        lambda: collections.defaultdict(list)
-    )
-
-    for original_index, record in enumerate(records, start=start_row):
-        row_number = original_index + 1
-        clip_id = normalize_name(record.get("clip_id"))
-
-        if is_excluded(clip_id, excluded_clip_ids):
-            continue
-
-        proposals = record.get("proposals") or []
-        if not isinstance(proposals, list):
-            continue
-
-        for proposal in proposals:
-            if not isinstance(proposal, dict):
+            counts = collections.Counter(clean.values())
+            if counts["yes"] != 2 or counts["no"] != 1:
                 continue
 
-            name = normalize_name(proposal.get("annotator_id"))
+            # Record the *original* three voters and action-wide exclusions.
+            # This is persisted before fourth reviews are added, so attribution
+            # does not depend on (typically alphabetical) export list order.
+            tracking_units.append({
+                "clip_id": clip_id,
+                "canonical_action_id": cid,
+                "horizon": horizon,
+                "original_raters": sorted(clean, key=str.casefold),
+                "ineligible_people": sorted(
+                    set(action_annotators.get(cid, set()))
+                    | set(provenance[cid]["proposers"]),
+                    key=str.casefold,
+                ),
+            })
+            unit_rows.append({
+                "row": row_number,
+                "canonical_action_id": cid,
+                "action": action_text(pool_map[cid]),
+                "horizon": horizon,
+                "band": HORIZON_LABELS.get(horizon, horizon),
+                # Existing report behaviour: people with any valid judgment on this action.
+                "annotators": sorted(action_annotators.get(cid, set()), key=str.casefold),
+                "proposers": provenance[cid]["proposers"],
+            })
 
-            if is_excluded(name, excluded_annotators):
-                continue
-            if is_ai_annotator(name, explicit_ai_names):
-                continue
-
-            by_person[name][row_number].append(proposal)
-
-    rows: list[dict[str, Any]] = []
-
-    for name, clip_map in by_person.items():
-        clip_numbers = sorted(clip_map)
-        incomplete_clips = sorted(
-            row_number
-            for row_number, proposals in clip_map.items()
-            if row_number not in ignored_incomplete_clip_numbers
-            and (
-                len(proposals) < 2
-                or any(not proposal_is_complete(proposal) for proposal in proposals)
-            )
-        )
-
-        action_count = sum(len(proposals) for proposals in clip_map.values())
-        clip_count = len(clip_numbers)
-        incomplete_count = len(incomplete_clips)
-
-        # Ignored clips stay in the denominator and are treated as completed.
-        completed_count = clip_count - incomplete_count
-        percentage = (
-            100.0 * completed_count / clip_count
-            if clip_count else 0.0
-        )
-
-        rows.append({
-            "name": name,
-            "actions": action_count,
-            "clips": clip_count,
-            "incomplete": incomplete_count,
-            "clip_ranges": compress_number_ranges(clip_numbers),
-            "incomplete_ranges": compress_number_ranges(incomplete_clips),
-            "percentage": percentage,
+    # Keep one displayed row per canonical action, with all disputed bands together.
+    grouped: dict[tuple[int, str], dict[str, Any]] = {}
+    for unit in unit_rows:
+        key = (unit["row"], unit["canonical_action_id"])
+        row = grouped.setdefault(key, {
+            "row": unit["row"],
+            "canonical_action_id": unit["canonical_action_id"],
+            "action": unit["action"],
+            "disagreements": [],
+            "proposers": unit["proposers"],
+        })
+        row["disagreements"].append({
+            "horizon": unit["horizon"],
+            "band": unit["band"],
+            "annotators": unit["annotators"],
         })
 
-    rows.sort(key=lambda row: (-row["actions"], row["name"].casefold()))
+    horizon_index = {h: i for i, h in enumerate(EXPECTED_HORIZONS)}
+    rows = list(grouped.values())
+    for row in rows:
+        row["disagreements"].sort(
+            key=lambda item: (horizon_index.get(item["horizon"], 999), item["horizon"])
+        )
+        row["annotators"] = sorted(
+            {name for item in row["disagreements"] for name in item["annotators"]},
+            key=str.casefold,
+        )
+        ineligible = {name.casefold() for name in row["annotators"]}
+        ineligible.update(name.casefold() for name in row["proposers"])
+        row["eligible_reviewers"] = [
+            name for name in reviewers if name.casefold() not in ineligible
+        ]
 
+    rows.sort(key=lambda row: (row["row"], row["canonical_action_id"]))
     return {
         "rows": rows,
-        "proposers": len(rows),
-        "incomplete_clips": sum(row["incomplete"] for row in rows),
-        "ignored_incomplete_clip_numbers": sorted(ignored_incomplete_clip_numbers),
+        "units": len(unit_rows),
+        "affected_actions": len(rows),
+        "reviewers": reviewers,
+        "tracking_units": tracking_units,
+        "conflicting_duplicate_ratings_excluded": conflicting_duplicate_ratings,
     }
 
 
-
-def rank_counts(
-    counts: collections.Counter[str] | dict[str, int],
-    *,
-    include_zero_names: set[str] | None = None,
-) -> list[dict[str, Any]]:
-    """Competition ranking: 1, 2, 2, 4 for ties."""
-    names = set(counts)
-    if include_zero_names:
-        names.update(include_zero_names)
-
-    ordered = sorted(
-        ((name, int(counts.get(name, 0))) for name in names),
-        key=lambda item: (-item[1], item[0].casefold()),
-    )
-
-    rows: list[dict[str, Any]] = []
-    previous_count: int | None = None
-    previous_rank = 0
-    for position, (name, count) in enumerate(ordered, start=1):
-        if count != previous_count:
-            previous_rank = position
-            previous_count = count
-        rows.append({"rank": previous_rank, "name": name, "count": count})
-    return rows
+def review_unit_key(clip_id: str, canonical_action_id: str, horizon: str) -> str:
+    """Use stable record identifiers rather than export row indexes."""
+    return json.dumps([clip_id, canonical_action_id, horizon],
+                      ensure_ascii=False, separators=(",", ":"))
 
 
-def analyse(
+def load_review_progress(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"version": 1, "tracked_units": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"Could not read review progress file {path}: {exc}") from exc
+    if (not isinstance(data, dict) or data.get("version") != 1
+            or not isinstance(data.get("tracked_units"), dict)):
+        raise ValueError(f"Unsupported or invalid review progress state: {path}")
+    for key, entry in data["tracked_units"].items():
+        if not isinstance(key, str) or not isinstance(entry, dict):
+            raise ValueError(f"Invalid tracked review unit in {path}")
+        if (not isinstance(entry.get("original_raters"), list)
+                or not isinstance(entry.get("ineligible_people"), list)):
+            raise ValueError(f"Invalid baseline for tracked review unit {key} in {path}")
+    return data
+
+
+def write_review_progress(path: Path, data: dict[str, Any]) -> None:
+    """Write only provenance/attribution, atomically; never touch the export."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = path.with_suffix(path.suffix + ".tmp")
+    try:
+        temp_path.write_text(
+            json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temp_path.replace(path)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def collect_current_review_ratings(
     records: list[dict[str, Any]],
+    *,
+    explicit_ai_names: set[str],
+    excluded_clip_ids: set[str],
+    excluded_annotators: set[str],
+) -> dict[str, dict[str, bool]]:
+    """Map unit -> human -> completion, excluding inconsistent duplicate votes."""
+    states: dict[str, dict[str, set[str]]] = collections.defaultdict(
+        lambda: collections.defaultdict(set)
+    )
+    completions: dict[str, set[str]] = collections.defaultdict(set)
+    for record in records:
+        clip_id = normalize_name(record.get("clip_id"))
+        if is_excluded(clip_id, excluded_clip_ids):
+            continue
+        pool = record.get("canonical_action_pool") or []
+        valid_ids = {canonical_id(item) for item in pool if isinstance(item, dict)} \
+            if isinstance(pool, list) else set()
+        annotations = record.get("annotations") or []
+        if not isinstance(annotations, list):
+            continue
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+            name = normalize_name(annotation.get("annotator_id"))
+            if (is_excluded(name, excluded_annotators)
+                    or is_ai_annotator(name, explicit_ai_names)):
+                continue
+            actions = annotation.get("canonical_actions") or []
+            if not isinstance(actions, list):
+                continue
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                cid = canonical_id(action)
+                if not cid or cid not in valid_ids:
+                    continue
+                judgments = action.get("horizon_judgments") or {}
+                if not isinstance(judgments, dict):
+                    continue
+                for horizon in EXPECTED_HORIZONS:
+                    judgment = judgments.get(horizon)
+                    state = valid_binary_judgment(judgment)
+                    if state is None:
+                        continue
+                    key = review_unit_key(clip_id, cid, horizon)
+                    states[key][name].add(state)
+                    if completed_horizon_judgment(judgment):
+                        completions[key].add(name)
+
+    return {
+        key: {
+            name: name in completions[key]
+            for name, values in people.items()
+            if len(values) == 1
+        }
+        for key, people in states.items()
+    }
+
+
+def analyse_review_progress(
+    records: list[dict[str, Any]],
+    *,
+    dispute_audit: dict[str, Any],
+    progress_path: Path,
+    target: int,
     explicit_ai_names: set[str],
     excluded_clip_ids: set[str],
     excluded_annotators: set[str],
 ) -> dict[str, Any]:
-    annotation_counts: collections.Counter[str] = collections.Counter()
-    started_action_counts: collections.Counter[str] = collections.Counter()
-    proposal_counts: collections.Counter[str] = collections.Counter()
-    full_clip_sets: dict[str, set[str]] = collections.defaultdict(set)
+    """Attribute a finished fourth judgment using a historical 3-voter snapshot.
 
-    human_names: set[str] = set()
-    ai_names: set[str] = set()
-    for record_index, record in enumerate(records):
+    Exports lack reliable per-judgment timestamps and often store annotators in
+    alphabetical order. A new reviewer is therefore identified by comparing
+    current observations to the original three-voter disagreement, retained in
+    a persistent JSON file. Existing 4+ ratings with no previous baseline are
+    deliberately *not* guessed/attributed to anyone.
+    """
+    progress = load_review_progress(progress_path)
+    tracked = progress["tracked_units"]
+    changed = not progress_path.exists()
+    for unit in dispute_audit["tracking_units"]:
+        key = review_unit_key(unit["clip_id"], unit["canonical_action_id"], unit["horizon"])
+        if key not in tracked:
+            tracked[key] = {
+                "original_raters": unit["original_raters"],
+                "ineligible_people": unit["ineligible_people"],
+                "reviewer": None,
+            }
+            changed = True
+
+    ratings = collect_current_review_ratings(
+        records,
+        explicit_ai_names=explicit_ai_names,
+        excluded_clip_ids=excluded_clip_ids,
+        excluded_annotators=excluded_annotators,
+    )
+    # Count only selected/current records even if the progress ledger contains
+    # baselines for other previously examined row ranges.
+    selected_clip_ids = {
+        normalize_name(record.get("clip_id")) for record in records
+        if not is_excluded(normalize_name(record.get("clip_id")), excluded_clip_ids)
+    }
+    roster = tuple(dispute_audit["reviewers"])
+    roster_by_casefold = {name.casefold(): name for name in roster}
+    counts = dict.fromkeys(roster, 0)
+    tracked_visible = 0
+    ambiguous = 0
+
+    for key, entry in tracked.items():
+        try:
+            clip_id, _cid, _horizon = json.loads(key)
+        except (ValueError, TypeError) as exc:
+            raise ValueError(f"Invalid unit identifier in review state: {key}") from exc
+        if clip_id not in selected_clip_ids:
+            continue
+        tracked_visible += 1
+        current = ratings.get(key, {})
+        current_by_casefold = {name.casefold(): (name, complete)
+                               for name, complete in current.items()}
+        original = {name.casefold() for name in entry["original_raters"]}
+        if not original.issubset(current_by_casefold):
+            continue
+        blocked = {name.casefold() for name in entry["ineligible_people"]}
+        attributed = entry.get("reviewer")
+        if attributed:
+            # A previously established fourth reviewer keeps credit while
+            # their completed judgment and the original three still exist.
+            match = current_by_casefold.get(str(attributed).casefold())
+            if match is not None and match[1]:
+                roster_name = roster_by_casefold.get(str(attributed).casefold())
+                if roster_name is not None:
+                    counts[roster_name] += 1
+            continue
+
+        # Only a *single* new fourth valid voter can be inferred. If two
+        # newcomers appear between exports, attribution cannot be recovered.
+        if len(current_by_casefold) != 4:
+            if len(current_by_casefold) > 4:
+                ambiguous += 1
+            continue
+        newcomers = [
+            roster_by_casefold[name]
+            for name, (_display, complete) in current_by_casefold.items()
+            if name not in blocked and name not in original and name in roster_by_casefold
+            and complete
+        ]
+        if len(newcomers) != 1:
+            continue
+        reviewer = newcomers[0]
+        entry["reviewer"] = reviewer
+        counts[reviewer] += 1
+        changed = True
+
+    if changed:
+        write_review_progress(progress_path, progress)
+
+    return {
+        "counts": counts,
+        "target": target,
+        "reviewers": roster,
+        "tracked_units": tracked_visible,
+        "ambiguous_units": ambiguous,
+        "progress_path": progress_path,
+    }
+
+
+def analyse_self_annotations(
+    records: list[dict[str, Any]],
+    *,
+    start_row: int,
+    explicit_ai_names: set[str],
+    excluded_clip_ids: set[str],
+    excluded_annotators: set[str],
+) -> dict[str, Any]:
+    rows: list[dict[str, Any]] = []
+    involved_people: set[str] = set()
+
+    for local_index, record in enumerate(records):
+        row_number = start_row + local_index + 1
         clip_id = normalize_name(record.get("clip_id"))
-        if clip_id == "Unknown":
-            clip_id = f"record_{record_index}"
-
         if is_excluded(clip_id, excluded_clip_ids):
             continue
 
-        canonical_pool = record.get("canonical_action_pool") or []
-        if not isinstance(canonical_pool, list):
-            canonical_pool = []
+        provenance = build_canonical_provenance(record)
 
-        for proposal in record.get("proposals") or []:
-            if not isinstance(proposal, dict):
-                continue
-            name = normalize_name(proposal.get("annotator_id"))
-            if is_excluded(name, excluded_annotators):
-                continue
-            if is_ai_annotator(name, explicit_ai_names):
-                ai_names.add(name)
-                continue
-            human_names.add(name)
-            if proposal_is_complete(proposal):
-                proposal_counts[name] += 1
+        annotations = record.get("annotations") or []
+        if not isinstance(annotations, list):
+            annotations = []
 
-        for annotation in record.get("annotations") or []:
+        action_annotators: dict[str, set[str]] = collections.defaultdict(set)
+        for annotation in annotations:
             if not isinstance(annotation, dict):
                 continue
             name = normalize_name(annotation.get("annotator_id"))
-            if is_excluded(name, excluded_annotators):
+            if is_excluded(name, excluded_annotators) or is_ai_annotator(name, explicit_ai_names):
                 continue
-            if is_ai_annotator(name, explicit_ai_names):
-                ai_names.add(name)
+            actions = annotation.get("canonical_actions") or []
+            if not isinstance(actions, list):
                 continue
-            human_names.add(name)
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                cid = canonical_id(action)
+                if cid not in provenance:
+                    continue
+                judgments = action.get("horizon_judgments") or {}
+                if not isinstance(judgments, dict):
+                    continue
+                if any(valid_binary_judgment(judgment) is not None for judgment in judgments.values()):
+                    action_annotators[cid].add(name)
 
-            matrix_actions = current_matrix_actions(canonical_pool, annotation)
-            for action in matrix_actions:
-                if action_is_started(action):
-                    started_action_counts[name] += 1
-                if action_is_complete(action):
-                    annotation_counts[name] += 1
+        for annotation in annotations:
+            if not isinstance(annotation, dict):
+                continue
+            annotator = normalize_name(annotation.get("annotator_id"))
+            if is_excluded(annotator, excluded_annotators) or is_ai_annotator(annotator, explicit_ai_names):
+                continue
+            actions = annotation.get("canonical_actions") or []
+            if not isinstance(actions, list):
+                continue
 
-            if clip_is_fully_annotated(matrix_actions):
-                full_clip_sets[name].add(clip_id)
+            for action in actions:
+                if not isinstance(action, dict):
+                    continue
+                cid = canonical_id(action)
+                info = provenance.get(cid)
+                if info is None:
+                    continue
+                matched = info["proposals_by_person"].get(annotator, [])
+                if not matched:
+                    continue
 
-    full_clip_counts = collections.Counter(
-        {name: len(clip_ids) for name, clip_ids in full_clip_sets.items()}
-    )
+                judgments = action.get("horizon_judgments") or {}
+                if not isinstance(judgments, dict):
+                    continue
+                valid_by_horizon = {
+                    str(horizon): state
+                    for horizon, judgment in judgments.items()
+                    if (state := valid_binary_judgment(judgment)) is not None
+                }
+                if not valid_by_horizon:
+                    continue
 
+                rows.append({
+                    "row": row_number,
+                    "canonical_action_id": cid,
+                    "action": action_text(info["pool_item"]),
+                    "annotator": annotator,
+                    "annotators": sorted(action_annotators.get(cid, set()), key=str.casefold),
+                })
+                involved_people.add(annotator)
+
+    rows.sort(key=lambda row: (row["row"], row["canonical_action_id"], row["annotator"].casefold()))
     return {
-        "annotation_counts": dict(annotation_counts),
-        "started_action_counts": dict(started_action_counts),
-        "proposal_counts": dict(proposal_counts),
-        "full_clip_counts": dict(full_clip_counts),
-        "annotation_ranking": rank_counts(annotation_counts, include_zero_names=human_names),
-        "full_clip_ranking": rank_counts(full_clip_counts, include_zero_names=human_names),
-        "proposal_ranking": rank_counts(proposal_counts, include_zero_names=human_names),
-        "summary": {
-            "human_contributors": len(human_names),
-            "total_annotations": sum(annotation_counts.values()),
-            "total_proposals": sum(proposal_counts.values()),
-            "full_clip_completions": sum(full_clip_counts.values()),
-        },
-        "human_names": sorted(human_names),
-        "ai_names": sorted(ai_names),
-        "excluded_clip_ids": sorted(excluded_clip_ids),
-        "excluded_annotators": sorted(excluded_annotators),
+        "rows": rows,
+        "events": len(rows),
+        "affected_actions": len({(r["row"], r["canonical_action_id"]) for r in rows}),
+        "people": sorted(involved_people, key=str.casefold),
     }
-
-
-def make_today_counts(
-    current_counts: dict[str, int],
-    baseline_counts: dict[str, int],
-    human_names: set[str],
-) -> dict[str, int]:
-    """Return net-new annotations for currently included human contributors only.
-
-    Restricting to ``human_names`` prevents names present only in older progress JSON
-    snapshots (for example a later-excluded test annotator) from leaking back into the
-    current-day ranking.
-    """
-    return {
-        name: max(0, int(current_counts.get(name, 0)) - int(baseline_counts.get(name, 0)))
-        for name in human_names
-    }
-
-
-def make_progress_json_payload(stats: dict[str, Any]) -> dict[str, dict[str, int]]:
-    """Build the intentionally minimal progress JSON payload.
-
-    The filename carries the timestamp. The JSON body contains only the three
-    requested counters for each included human contributor.
-    """
-    names = sorted(set(stats["human_names"]), key=str.casefold)
-    annotation_counts = stats["annotation_counts"]
-    full_clip_counts = stats["full_clip_counts"]
-    proposal_counts = stats["proposal_counts"]
-    return {
-        name: {
-            "actions_annotated": int(annotation_counts.get(name, 0)),
-            "clips_fully_annotated": int(full_clip_counts.get(name, 0)),
-            "proposals": int(proposal_counts.get(name, 0)),
-        }
-        for name in names
-    }
-
-
-def progress_json_snapshot_path(progress_json_dir: Path, when_nsw: dt.datetime) -> Path:
-    """Return one deterministic snapshot path per NSW local clock hour."""
-    hour = when_nsw.replace(minute=0, second=0, microsecond=0)
-    day_dir = progress_json_dir / hour.date().isoformat()
-    filename = f"{PROGRESS_JSON_PREFIX}_{hour:%Y-%m-%d_%H00}_NSW.json"
-    return day_dir / filename
-
-
-def write_json_atomic(path: Path, payload: dict[str, Any]) -> None:
-    text = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
-    write_text_atomic(path, text)
-
-
-def load_progress_json(path: Path) -> dict[str, dict[str, int]] | None:
-    """Load and validate the compact three-counter progress JSON format."""
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, json.JSONDecodeError):
-        return None
-    if not isinstance(value, dict):
-        return None
-
-    parsed: dict[str, dict[str, int]] = {}
-    required = {"actions_annotated", "clips_fully_annotated", "proposals"}
-    for raw_name, raw_metrics in value.items():
-        if not isinstance(raw_name, str) or not isinstance(raw_metrics, dict):
-            return None
-        if set(raw_metrics) != required:
-            return None
-        try:
-            parsed[raw_name] = {
-                key: int(raw_metrics[key])
-                for key in ("actions_annotated", "clips_fully_annotated", "proposals")
-            }
-        except (TypeError, ValueError, KeyError):
-            return None
-    return parsed
-
-
-def find_day_baseline(
-    progress_json_dir: Path,
-    nsw_date: dt.date,
-) -> tuple[Path, dict[str, dict[str, int]]] | None:
-    """Return the earliest valid progress JSON snapshot saved for an NSW local date."""
-    day_dir = progress_json_dir / nsw_date.isoformat()
-    if not day_dir.is_dir():
-        return None
-
-    pattern = f"{PROGRESS_JSON_PREFIX}_{nsw_date.isoformat()}_*_NSW.json"
-    for path in sorted(day_dir.glob(pattern), key=lambda item: item.name):
-        payload = load_progress_json(path)
-        if payload is not None:
-            return path, payload
-    return None
-
-
-def counts_from_progress_json(
-    payload: dict[str, dict[str, int]],
-    metric: str,
-) -> dict[str, int]:
-    return {
-        name: int(metrics.get(metric, 0))
-        for name, metrics in payload.items()
-    }
-
-
-def write_text_atomic(path: Path, text: str) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(text, encoding="utf-8")
-    temp.replace(path)
 
 
 def esc(value: Any) -> str:
@@ -960,1032 +817,327 @@ def fmt_int(value: Any) -> str:
         return "—"
 
 
-def medal_for_rank(rank: int) -> str:
-    return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "")
+def badge(value: str, css_class: str = "") -> str:
+    return f'<span class="badge {esc(css_class)}">{esc(value)}</span>'
 
 
-def top_person(rows: list[dict[str, Any]]) -> tuple[str, int] | None:
-    if not rows:
-        return None
-    count = int(rows[0]["count"])
-    if count <= 0:
-        return None
-    return str(rows[0]["name"]), count
+def render_two_yes_one_no_table(audit: dict[str, Any]) -> str:
+    if not audit["rows"]:
+        return '<div class="clear-box">✓ No strict 2 Yes / 1 No units found.</div>'
+
+    options = "".join(
+        f'<option value="{esc(name)}">{esc(name)}</option>'
+        for name in audit["reviewers"]
+    )
+    filter_html = (
+        '<div class="filter-toolbar">'
+        '<label for="eligible-reviewer-filter">Show actions eligible for</label>'
+        '<select id="eligible-reviewer-filter" aria-controls="disagreement-table">'
+        '<option value="">All reviewers (all actions)</option>'
+        f'{options}'
+        '</select>'
+        f'<span class="filter-status" id="eligible-filter-status" role="status" aria-live="polite">'
+        f'Showing all {fmt_int(len(audit["rows"]))} actions '
+        f'({fmt_int(audit["units"])} disputed time bands)</span>'
+        '</div>'
+    )
+    body = []
+    for row in audit["rows"]:
+        bands_html = "".join(
+            f'<div class="band-line">{esc(item["band"])}</div>'
+            for item in row["disagreements"]
+        )
+        annotators_html = " ".join(badge(name) for name in row["annotators"]) or "—"
+        proposers_html = " ".join(badge(name, "proposer") for name in row["proposers"]) or "—"
+        eligible_html = " ".join(
+            badge(name, "eligible") for name in row["eligible_reviewers"]
+        ) or '<span class="none-eligible">None</span>'
+        # Escaped JSON in a data attribute keeps exact names intact (including
+        # punctuation and non-ASCII characters), without relying on delimiters.
+        eligible_json = esc(json.dumps(row["eligible_reviewers"], ensure_ascii=False))
+        body.append(
+            f'<tr data-eligible="{eligible_json}" data-band-count="{len(row["disagreements"])}">'
+            f'<td class="num">{fmt_int(row["row"])}</td>'
+            f'<td class="ca">{esc(row["canonical_action_id"])}</td>'
+            f'<td class="action">{esc(row["action"])}</td>'
+            f'<td class="band">{bands_html}</td>'
+            f'<td class="annotators">{annotators_html}</td>'
+            f'<td class="proposers">{proposers_html}</td>'
+            f'<td class="eligible-reviewers">{eligible_html}</td>'
+            "</tr>"
+        )
+    table_html = (
+        '<div class="table-wrap"><table id="disagreement-table" '
+        'class="audit-table disagreement-table">'
+        '<thead><tr><th>Row</th><th>CA</th><th>Action</th><th>Time bands</th>'
+        '<th>Annotated by</th><th>Proposed by</th><th>Eligible reviewers</th></tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
+    )
+    return (
+        filter_html + table_html +
+        '<div class="filter-empty" id="eligible-filter-empty" role="status" hidden></div>'
+    )
 
 
-def render_combined_activity_card(
-    title: str,
-    subtitle: str,
-    total_rows: list[dict[str, Any]],
-    today_rows: list[dict[str, Any]],
-    noun: str,
-    accent_class: str,
-    icon: str,
-) -> str:
-    today_by_name = {
-        str(row["name"]): int(row["count"])
-        for row in today_rows
+# The report is self-contained: filtering runs entirely in the generated HTML.
+REVIEWER_FILTER_SCRIPT = """<script>
+(() => {
+  'use strict';
+  const filter = document.getElementById('eligible-reviewer-filter');
+  if (!filter) return;
+  const rows = Array.from(document.querySelectorAll('#disagreement-table tbody tr[data-eligible]'));
+  const status = document.getElementById('eligible-filter-status');
+  const empty = document.getElementById('eligible-filter-empty');
+  const format = (count) => new Intl.NumberFormat().format(count);
+
+  function applyReviewerFilter() {
+    const reviewer = filter.value;
+    let actions = 0;
+    let bands = 0;
+    for (const row of rows) {
+      const eligible = JSON.parse(row.dataset.eligible || '[]');
+      const visible = !reviewer || eligible.includes(reviewer);
+      row.hidden = !visible;
+      if (visible) {
+        actions += 1;
+        bands += Number(row.dataset.bandCount || 0);
+      }
     }
+    status.textContent = reviewer
+      ? `Showing ${format(actions)} eligible actions (${format(bands)} disputed time bands)`
+      : `Showing all ${format(actions)} actions (${format(bands)} disputed time bands)`;
+    empty.hidden = !reviewer || actions > 0;
+    if (!empty.hidden) empty.textContent = `No disputed actions are eligible for ${reviewer}.`;
+  }
 
-    top = top_person(total_rows)
-    if top:
-        top_html = (
-            '<div class="leader-strip"><span class="leader-crown">👑</span>'
-            f'<span><b>{esc(top[0])}</b> leads overall with '
-            f'<b>{fmt_int(top[1])}</b> {esc(noun)}.</span></div>'
-        )
-    else:
-        top_html = '<div class="leader-strip muted-strip">No activity recorded yet.</div>'
+  filter.addEventListener('change', applyReviewerFilter);
+  applyReviewerFilter();
+})();
+</script>"""
 
+
+def render_review_progress_chart(progress: dict[str, Any]) -> str:
+    target = progress["target"]
+    items = sorted(
+        ((name, int(progress["counts"].get(name, 0))) for name in progress["reviewers"]),
+        key=lambda item: (-item[1], item[0].casefold()),
+    )
     bars = []
-    table_rows = []
-    max_count = max((int(row["count"]) for row in total_rows), default=0) or 1
-
-    for row in total_rows:
-        rank = int(row["rank"])
-        name = str(row["name"])
-        total = int(row["count"])
-        today = int(today_by_name.get(name, 0))
-        width = 100.0 * total / max_count
-        today_class = "today-zero" if today == 0 else "today-positive"
-
+    for name, count in items:
+        percent = 100 * count / target
         bars.append(
-            '<div class="bar-row combined-bar-row">'
-            f'<div class="bar-person" title="{esc(name)}">'
-            f'<span class="bar-medal">{medal_for_rank(rank)}</span>'
-            f'{esc(name)}</div>'
-            '<div class="bar-track">'
-            f'<div class="bar-fill" style="width:{width:.2f}%"></div>'
+            '<div class="progress-bar-row">'
+            f'<div class="progress-person" title="{esc(name)}">{esc(name)}</div>'
+            f'<div class="progress-track" role="progressbar" aria-label="{esc(name)}" '
+            f'aria-valuemin="0" aria-valuemax="{target}" '
+            f'aria-valuenow="{min(target, count)}">'
+            f'<div class="progress-fill" style="width:{min(100., percent):.2f}%"></div>'
             '</div>'
-            f'<div class="bar-count combined-bar-count">'
-            f'<b>{fmt_int(total)}</b>'
-            f'<span class="today-inline {today_class}">+{fmt_int(today)}</span>'
-            '</div>'
+            f'<div class="progress-count"><b>{fmt_int(count)}</b>'
+            f'<span> / {fmt_int(target)}</span></div>'
             '</div>'
         )
-
-        table_rows.append(
-            '<tr>'
-            f'<td class="rank-cell"><span class="rank-number">{rank}</span>'
-            f'<span class="medal">{medal_for_rank(rank)}</span></td>'
-            f'<td><span class="person-name">{esc(name)}</span></td>'
-            f'<td class="numeric combined-total">{fmt_int(total)}</td>'
-            f'<td class="numeric today-value {today_class}">+{fmt_int(today)}</td>'
-            '</tr>'
-        )
-
-    table = (
-        '<div class="empty">No recorded activity.</div>'
-        if not table_rows
-        else (
-            '<div class="table-wrap"><table class="combined-table">'
-            '<thead><tr><th>Rank</th><th>Person</th><th>Total</th><th>Today</th></tr></thead>'
-            f'<tbody>{"".join(table_rows)}</tbody></table></div>'
-        )
+    return (
+        '<section class="panel review-progress">'
+        '<div class="progress-heading"><h2>Adjudication progress</h2>'
+        f'<span class="progress-target">Target: {fmt_int(target)} units per person</span></div>'
+        '<p>One unit is one previously disputed time band completed by an eligible fourth reviewer. '
+        'Attribution begins after an original three-rater baseline is saved.</p>'
+        f'<div class="progress-bars">{"".join(bars)}</div>'
+        '</section>'
     )
 
-    return f"""
-    <section class="panel leaderboard-panel {esc(accent_class)}">
-      <div class="panel-heading">
-        <div class="panel-icon">{icon}</div>
-        <div>
-          <h2>{esc(title)}</h2>
-          <p>{esc(subtitle)}</p>
-        </div>
-      </div>
-      {top_html}
-      <div class="bars">{"".join(bars[:12])}</div>
-      <h3>Full ranking</h3>
-      {table}
-    </section>
-    """
 
-
-def render_completion_quality_card(stats: dict[str, Any]) -> str:
-    rows = []
-    for name in stats["human_names"]:
-        started = int(stats["started_action_counts"].get(name, 0))
-        completed = int(stats["annotation_counts"].get(name, 0))
-        rate = (100.0 * completed / started) if started else 0.0
-        rows.append(
-            {
-                "name": name,
-                "started": started,
-                "completed": completed,
-                "rate": rate,
-            }
+def render_self_annotation_table(audit: dict[str, Any]) -> str:
+    if not audit["rows"]:
+        return '<div class="clear-box">✓ No self-annotation/proposer overlap found.</div>'
+    body = []
+    for row in audit["rows"]:
+        annotators_html = " ".join(badge(name) for name in row.get("annotators", [])) or "—"
+        body.append(
+            "<tr>"
+            f'<td class="num">{fmt_int(row["row"])}</td>'
+            f'<td class="ca">{esc(row["canonical_action_id"])}</td>'
+            f'<td class="action">{esc(row["action"])}</td>'
+            f'<td class="person">{esc(row["annotator"])}</td>'
+            f'<td class="annotators">{annotators_html}</td>'
+            "</tr>"
         )
-
-    rows.sort(
-        key=lambda row: (
-            -row["rate"],
-            -row["completed"],
-            row["name"].casefold(),
-        )
+    return (
+        '<div class="table-wrap"><table class="audit-table self-table">'
+        '<thead><tr><th>Row</th><th>CA</th><th>Canonical action</th><th>Annotator / proposer</th>'
+        '<th>Annotated by</th></tr></thead>'
+        f'<tbody>{"".join(body)}</tbody></table></div>'
     )
-
-    ranked_rows = []
-    previous_rate: float | None = None
-    previous_rank = 0
-    for position, row in enumerate(rows, start=1):
-        if previous_rate is None or abs(row["rate"] - previous_rate) > 1e-9:
-            previous_rank = position
-            previous_rate = row["rate"]
-        ranked_rows.append({**row, "rank": previous_rank})
-
-    if ranked_rows and ranked_rows[0]["started"] > 0:
-        leader = ranked_rows[0]
-        top_html = (
-            '<div class="leader-strip"><span class="leader-crown">✨</span>'
-            f'<span><b>{esc(leader["name"])}</b> has the highest completion quality at '
-            f'<b>{leader["rate"]:.0f}%</b>.</span></div>'
-        )
-    else:
-        top_html = '<div class="leader-strip muted-strip">No started actions recorded yet.</div>'
-
-    bars = []
-    table_rows = []
-
-    for row in ranked_rows:
-        rate = float(row["rate"])
-        bars.append(
-            '<div class="bar-row quality-bar-row">'
-            f'<div class="bar-person" title="{esc(row["name"])}">'
-            f'<span class="bar-medal">{medal_for_rank(int(row["rank"]))}</span>'
-            f'{esc(row["name"])}</div>'
-            '<div class="bar-track">'
-            f'<div class="bar-fill quality-fill" style="width:{min(100.0, rate):.2f}%"></div>'
-            '</div>'
-            f'<div class="bar-count">{rate:.0f}%</div>'
-            '</div>'
-        )
-
-        table_rows.append(
-            '<tr>'
-            f'<td class="rank-cell"><span class="rank-number">{int(row["rank"])}</span>'
-            f'<span class="medal">{medal_for_rank(int(row["rank"]))}</span></td>'
-            f'<td><span class="person-name">{esc(row["name"])}</span></td>'
-            f'<td class="numeric">{fmt_int(row["started"])}</td>'
-            f'<td class="numeric">{fmt_int(row["completed"])}</td>'
-            f'<td class="numeric quality-rate">{rate:.0f}%</td>'
-            '</tr>'
-        )
-
-    table = (
-        '<div class="empty">No contributors detected.</div>'
-        if not table_rows
-        else (
-            '<div class="table-wrap"><table class="quality-table">'
-            '<thead><tr><th>Rank</th><th>Person</th><th>Started</th>'
-            '<th>Completed</th><th>Quality</th></tr></thead>'
-            f'<tbody>{"".join(table_rows)}</tbody></table></div>'
-        )
-    )
-
-    return f"""
-    <section class="panel leaderboard-panel accent-orange">
-      <div class="panel-heading">
-        <div class="panel-icon">✨</div>
-        <div>
-          <h2>Completion quality</h2>
-          <p>A video is only completed if all annotations are completed with proper justifications.</p>
-        </div>
-      </div>
-      {top_html}
-      <div class="bars">{"".join(bars[:12])}</div>
-      <h3>Full ranking</h3>
-      {table}
-    </section>
-    """
-
-def render_target_card(
-    rows: list[dict[str, Any]],
-    target_clips: int,
-) -> str:
-    if rows:
-        leader = rows[0]
-        leader_pct = 100.0 * int(leader["count"]) / target_clips
-        top_html = (
-            '<div class="leader-strip"><span class="leader-crown">🎯</span>'
-            f'<span><b>{esc(leader["name"])}</b> is at '
-            f'<b>{fmt_int(leader["count"])}/{fmt_int(target_clips)}</b> clips '
-            f'({leader_pct:.0f}%).</span></div>'
-        )
-    else:
-        top_html = '<div class="leader-strip muted-strip">No clip completions recorded yet.</div>'
-
-    bars = []
-    table_rows = []
-    for row in rows:
-        count = int(row["count"])
-        pct = 100.0 * count / target_clips
-        width = min(100.0, pct)
-        bars.append(
-            '<div class="bar-row target-row">'
-            f'<div class="bar-person" title="{esc(row["name"])}">'
-            f'<span class="bar-medal">{medal_for_rank(int(row["rank"]))}</span>'
-            f'{esc(row["name"])}</div>'
-            '<div class="bar-track">'
-            f'<div class="bar-fill target-fill" style="width:{width:.2f}%"></div>'
-            '</div>'
-            f'<div class="bar-count">{count}/{target_clips}</div>'
-            '</div>'
-        )
-        table_rows.append(
-            '<tr>'
-            f'<td class="rank-cell"><span class="rank-number">{int(row["rank"])}</span>'
-            f'<span class="medal">{medal_for_rank(int(row["rank"]))}</span></td>'
-            f'<td><span class="person-name">{esc(row["name"])}</span></td>'
-            f'<td class="numeric">{fmt_int(count)}</td>'
-            f'<td class="numeric">{fmt_int(target_clips)}</td>'
-            f'<td class="numeric">{pct:.0f}%</td>'
-            '</tr>'
-        )
-
-    table = (
-        '<div class="empty">No contributors detected.</div>'
-        if not table_rows
-        else (
-            '<div class="table-wrap"><table class="target-table">'
-            '<thead><tr><th>Rank</th><th>Person</th><th>Full clips</th>'
-            '<th>Target</th><th>Progress</th></tr></thead>'
-            f'<tbody>{"".join(table_rows)}</tbody></table></div>'
-        )
-    )
-
-    return f'''
-    <section class="panel leaderboard-panel accent-purple">
-      <div class="panel-heading">
-        <div class="panel-icon">🏁</div>
-        <div>
-          <h2>Fully annotated clips</h2>
-          <p>Each person has a target of {fmt_int(target_clips)} fully annotated clips. </p>
-        </div>
-      </div>
-      {top_html}
-      <div class="bars">{"".join(bars[:12])}</div>
-      <h3>Target progress</h3>
-      {table}
-    </section>
-    '''
-
-
-def render_compact_audit(audit: dict[str, Any]) -> str:
-    total_findings = int(audit["total_findings"])
-    people_affected = int(audit["people_affected"])
-
-    if total_findings == 0:
-        body = (
-            '<div class="audit-clear">✓ No unanswered bands, untouched actions, '
-            'or missing supporting details found in started clips.</div>'
-        )
-    else:
-        people_html = []
-
-        for name, findings in audit["by_person"].items():
-            rows = "".join(
-                '<tr>'
-                f'<td class="audit-row">{fmt_int(finding["row"])}</td>'
-                f'<td class="audit-ca">{esc(finding["ca"])}</td>'
-                f'<td class="audit-action" title="{esc(finding["action"])}">'
-                f'{esc(finding["action"])}</td>'
-                f'<td class="audit-band">{esc(finding["band"])}</td>'
-                '</tr>'
-                for finding in findings
-            )
-
-            people_html.append(
-                '<details class="audit-person" open>'
-                '<summary>'
-                f'<span class="audit-name">{esc(name)}</span>'
-                f'<span class="audit-count">{fmt_int(len(findings))} issue'
-                f'{"s" if len(findings) != 1 else ""}</span>'
-                '</summary>'
-                '<div class="audit-table-wrap">'
-                '<table class="audit-table">'
-                '<thead><tr><th>Row</th><th>CA</th><th>Action</th><th>Time band</th></tr></thead>'
-                f'<tbody>{rows}</tbody>'
-                '</table>'
-                '</div>'
-                '</details>'
-            )
-
-        body = "".join(people_html)
-
-    return f'''
-    <section class="panel compact-audit">
-      <div class="audit-heading">
-        <div>
-          <h2>Incomplete annotation details</h2>
-          <p>After an annotator starts a clip: unanswered bands, untouched canonical actions, and Yes/No judgments missing required details.</p>
-        </div>
-        <div class="audit-summary">
-          <span><b>{fmt_int(total_findings)}</b> findings</span>
-          <span><b>{fmt_int(people_affected)}</b> people affected</span>
-        </div>
-      </div>
-      {body}
-    </section>
-    '''
-
-
-
-def render_proposal_details(details: dict[str, Any]) -> str:
-    rows = details["rows"]
-    ignored_clip_numbers = details.get("ignored_incomplete_clip_numbers", [])
-    ignored_ranges = compress_number_ranges(list(ignored_clip_numbers))
-    ignore_note = (
-        f" Ignored for incompleteness: {esc(ignored_ranges)}."
-        if ignored_ranges else ""
-    )
-
-    if not rows:
-        table = (
-            '<div class="proposal-clear">'
-            'No human proposal records found in the selected rows.'
-            '</div>'
-        )
-    else:
-        body = "".join(
-            '<tr>'
-            f'<td class="proposal-name">{esc(row["name"])}</td>'
-            f'<td class="numeric">{fmt_int(row["actions"])}</td>'
-            f'<td class="numeric">{fmt_int(row["clips"])}</td>'
-            f'<td class="numeric proposal-incomplete">{fmt_int(row["incomplete"])}</td>'
-            f'<td class="proposal-clips">{esc(row["clip_ranges"]) or "—"}</td>'
-            f'<td class="proposal-clips proposal-incomplete-ranges">'
-            f'{esc(row["incomplete_ranges"]) or "—"}</td>'
-            f'<td class="numeric">{row["percentage"]:.1f}%</td>'
-            '</tr>'
-            for row in rows
-        )
-
-        table = (
-            '<div class="proposal-table-wrap">'
-            '<table class="proposal-detail-table">'
-            '<thead><tr>'
-            '<th>Proposer</th>'
-            '<th>Actions</th>'
-            '<th>Clips</th>'
-            '<th>Incomplete</th>'
-            '<th>Clips</th>'
-            '<th>Incomplete clips</th>'
-            '<th>Complete</th>'
-            '</tr></thead>'
-            f'<tbody>{body}</tbody>'
-            '</table>'
-            '</div>'
-        )
-
-    return f"""
-    <section class="panel proposal-details">
-      <div class="proposal-details-heading">
-        <div>
-          <h2>Incomplete proposal details</h2>
-          <p>Incomplete = fewer than 2 proposals, or missing reason/facts.{ignore_note}</p>
-        </div>
-        <div class="proposal-details-summary">
-          <span><b>{fmt_int(details["proposers"])}</b> proposers</span>
-          <span><b>{fmt_int(details["incomplete_clips"])}</b> incomplete</span>
-        </div>
-      </div>
-      {table}
-    </section>
-    """
-
 
 
 def render_dashboard(
-    stats: dict[str, Any],
-    today_ranking: list[dict[str, Any]],
-    proposals_today_ranking: list[dict[str, Any]],
-    audit: dict[str, Any],
-    proposal_details: dict[str, Any],
+    two_one: dict[str, Any],
+    self_audit: dict[str, Any],
+    review_progress: dict[str, Any],
     *,
-    target_clips: int,
-    generated_at_nsw: dt.datetime,
+    excluded_clip_ids: set[str],
+    excluded_annotators: set[str],
+    explicit_ai_names: set[str],
 ) -> str:
-    s = stats["summary"]
-    ai_names = ", ".join(stats["ai_names"]) if stats["ai_names"] else "none detected"
-
-    total_today = sum(int(row["count"]) for row in today_ranking)
-    target_reached = sum(
-        1 for row in stats["full_clip_ranking"] if int(row["count"]) >= target_clips
+    generated = dt.datetime.now().astimezone()
+    people = ", ".join(self_audit["people"]) if self_audit["people"] else "none"
+    exclusions = (
+        f"Annotators: {', '.join(sorted(excluded_annotators)) or 'none'} · "
+        f"Clips: {', '.join(sorted(excluded_clip_ids)) or 'none'}"
     )
-
-    annotation_top = top_person(stats["annotation_ranking"])
-    full_clip_top = top_person(stats["full_clip_ranking"])
-    today_top = top_person(today_ranking)
-    proposal_top = top_person(stats["proposal_ranking"])
-
-    def mini_leader(label: str, leader: tuple[str, int] | None, suffix: str = "") -> str:
-        if leader is None:
-            return (
-                f'<div class="mini-leader"><span>{esc(label)}</span>'
-                '<b>—</b><small>No activity</small></div>'
-            )
-        return (
-            f'<div class="mini-leader"><span>{esc(label)}</span>'
-            f'<b>{esc(leader[0])}</b><small>{fmt_int(leader[1])}{esc(suffix)}</small></div>'
-        )
-
-    if full_clip_top:
-        full_mini = (
-            '<div class="mini-leader"><span>Full clip target</span>'
-            f'<b>{esc(full_clip_top[0])}</b>'
-            f'<small>{fmt_int(full_clip_top[1])}/{fmt_int(target_clips)} clips</small></div>'
-        )
-    else:
-        full_mini = (
-            '<div class="mini-leader"><span>Full clip target</span>'
-            '<b>—</b><small>No completed clips</small></div>'
-        )
-
-    cards = [
-        ("👥", "Contributors", s["human_contributors"], "human participants detected"),
-        ("✅", "Annotations", s["total_annotations"], "actions annotated overall"),
-        ("📅", "Annotated today", total_today, "since start of today"),
-        ("🏁", "Target reached", target_reached, f'people at ≥ {target_clips:,} full clips'),
-        ("💡", "Actions proposed", s["total_proposals"], "human proposals"),
-    ]
-    cards_html = "".join(
-        f'''<div class="metric-card">
-          <div class="metric-icon">{icon}</div>
-          <div class="metric-label">{esc(label)}</div>
-          <div class="metric-value">{fmt_int(value)}</div>
-          <div class="metric-sub">{esc(sub)}</div>
-        </div>'''
-        for icon, label, value, sub in cards
-    )
-
-    annotation_activity_card = render_combined_activity_card(
-        "Annotation progress",
-        "Number of completed annotations",
-        stats["annotation_ranking"],
-        today_ranking,
-        "annotations",
-        "accent-blue",
-        "🏆",
-    )
-    proposal_activity_card = render_combined_activity_card(
-        "Proposal progress",
-        "Number of action proposals.",
-        stats["proposal_ranking"],
-        proposals_today_ranking,
-        "proposals",
-        "accent-green",
-        "💡",
-    )
-    full_clip_card = render_target_card(stats["full_clip_ranking"], target_clips)
-    completion_quality_card = render_completion_quality_card(stats)
-    compact_audit = render_compact_audit(audit)
-    proposal_details_html = render_proposal_details(proposal_details)
-
     return f'''<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Team Annotation Progress</title>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Annotation Conflict Audit</title>
 <style>
-:root {{
-  color-scheme:dark;
-  --bg:#090d18;
-  --panel:#111827;
-  --panel-soft:#151e31;
-  --text:#f4f7ff;
-  --muted:#9aa8c5;
-  --line:#28344e;
-  --blue:#78a7ff;
-  --cyan:#62d6d2;
-  --green:#67d89f;
-  --purple:#bb91ff;
-  --orange:#ffbd73;
-}}
-* {{ box-sizing:border-box; }}
-html {{ scroll-behavior:smooth; }}
-body {{
-  margin:0;
-  min-height:100vh;
-  font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
-  color:var(--text);
-  background:
-    radial-gradient(circle at 12% -5%,rgba(83,119,255,.22),transparent 34rem),
-    radial-gradient(circle at 92% 12%,rgba(99,214,159,.12),transparent 30rem),
-    var(--bg);
-}}
-.container {{ max-width:1440px; margin:0 auto; padding:30px 24px 64px; }}
-.hero {{
-  position:relative;
-  overflow:hidden;
-  border:1px solid var(--line);
-  border-radius:26px;
-  padding:30px;
-  background:linear-gradient(135deg,rgba(30,46,80,.98),rgba(16,24,41,.98));
-  box-shadow:0 24px 70px rgba(0,0,0,.28);
-}}
-.hero:after {{
-  content:"";
-  position:absolute;
-  width:340px;
-  height:340px;
-  right:-120px;
-  top:-170px;
-  border-radius:50%;
-  background:radial-gradient(circle,rgba(120,167,255,.28),transparent 68%);
-  pointer-events:none;
-}}
-.eyebrow {{ color:#b8c8eb; text-transform:uppercase; letter-spacing:.16em; font-size:11px; font-weight:800; }}
-h1 {{ margin:8px 0 10px; font-size:clamp(32px,5vw,56px); line-height:1.03; letter-spacing:-.045em; }}
-.hero-meta {{ display:flex; flex-wrap:wrap; gap:8px 18px; margin-top:20px; color:#8fa2c7; font-size:12px; }}
-.hero-meta b {{ color:#dce6fb; }}
-.mode-pill {{ display:inline-block; padding:4px 9px; border:1px solid #42567e; border-radius:999px; background:#15233b; color:#dbe7ff; font-weight:800; }}
-.metrics {{ display:grid; grid-template-columns:repeat(5,minmax(0,1fr)); gap:13px; margin:18px 0; }}
-.metric-card {{ border:1px solid var(--line); background:rgba(17,24,39,.94); border-radius:18px; padding:17px; min-width:0; }}
-.metric-icon {{ font-size:18px; }}
-.metric-label {{ margin-top:9px; color:#9fb0cf; text-transform:uppercase; letter-spacing:.08em; font-size:9px; font-weight:850; }}
-.metric-value {{ margin:4px 0; font-size:27px; font-weight:900; letter-spacing:-.025em; }}
-.metric-sub {{ color:#8394b5; font-size:10px; line-height:1.4; }}
-.snapshot {{ margin-bottom:18px; }}
-.panel {{ border:1px solid var(--line); border-radius:21px; padding:20px; background:rgba(17,24,39,.95); box-shadow:0 14px 34px rgba(0,0,0,.16); }}
-.panel h2 {{ margin:0; font-size:19px; letter-spacing:-.02em; }}
-.panel h3 {{ margin:18px 0 10px; color:#cbd7ef; font-size:11px; text-transform:uppercase; letter-spacing:.08em; }}
-.panel p {{ margin:5px 0 0; color:var(--muted); line-height:1.55; font-size:11px; }}
-.momentum {{ display:grid; grid-template-columns:repeat(4,1fr); gap:11px; margin-top:15px; }}
-.mini-leader {{ border:1px solid var(--line); border-radius:14px; background:#0d1422; padding:13px; min-width:0; }}
-.mini-leader span {{ display:block; color:#8ea0c2; text-transform:uppercase; letter-spacing:.07em; font-size:8px; font-weight:850; }}
-.mini-leader b {{ display:block; margin:5px 0 2px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; font-size:13px; }}
-.mini-leader small {{ color:#aebbd5; font-size:9px; }}
-.dashboard-grid {{ display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:18px; }}
-.leaderboard-panel {{ min-width:0; }}
-.accent-blue {{ border-top:3px solid var(--blue); }}
-.accent-purple {{ border-top:3px solid var(--purple); }}
-.accent-green {{ border-top:3px solid var(--green); }}
-.accent-orange {{ border-top:3px solid var(--orange); }}
-.panel-heading {{ display:flex; gap:12px; align-items:flex-start; }}
-.panel-icon {{ display:grid; place-items:center; width:38px; height:38px; flex:0 0 38px; border:1px solid var(--line); border-radius:12px; background:#0c1423; font-size:19px; }}
-.leader-strip {{ display:flex; gap:8px; align-items:center; margin:15px 0 14px; padding:10px 12px; border:1px solid #31415f; border-radius:12px; background:#101a2d; color:#cbd8f1; font-size:11px; }}
-.leader-crown {{ font-size:17px; }}
-.muted-strip {{ color:var(--muted); }}
-.bars {{ margin:6px 0 4px; }}
-.bar-row {{ display:grid; grid-template-columns:minmax(110px,180px) 1fr 58px; gap:10px; align-items:center; margin:9px 0; }}
-.bar-person {{ min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:11px; color:#dce6fb; }}
-.bar-medal {{ display:inline-block; width:20px; }}
-.bar-track {{ height:11px; border-radius:999px; overflow:hidden; background:#202b42; }}
-.bar-fill {{ height:100%; border-radius:999px; background:linear-gradient(90deg,var(--blue),var(--cyan)); }}
-.target-fill {{ background:linear-gradient(90deg,var(--purple),#e1a5ff); }}
-.bar-count {{ text-align:right; color:#bdc9e1; font-size:11px; font-weight:800; font-variant-numeric:tabular-nums; }}
-.table-wrap {{ border:1px solid var(--line); border-radius:14px; overflow:hidden; }}
-table {{ width:100%; border-collapse:collapse; table-layout:fixed; }}
-th,td {{ padding:10px 11px; border-bottom:1px solid var(--line); text-align:left; vertical-align:middle; overflow-wrap:anywhere; }}
-th {{ color:#95a8cc; background:#151e31; text-transform:uppercase; letter-spacing:.06em; font-size:9px; }}
-td {{ color:#dce6fb; font-size:11px; }}
-tbody tr:last-child td {{ border-bottom:0; }}
-tbody tr:hover td {{ background:#141d30; }}
-.target-table th:nth-child(1),.target-table td:nth-child(1) {{ width:66px; }}
-.target-table th:nth-child(3),.target-table td:nth-child(3),
-.target-table th:nth-child(4),.target-table td:nth-child(4),
-.target-table th:nth-child(5),.target-table td:nth-child(5) {{ width:86px; text-align:right; }}
-.combined-table th:nth-child(1),.combined-table td:nth-child(1) {{ width:72px; }}
-.combined-table th:nth-child(3),.combined-table td:nth-child(3),
-.combined-table th:nth-child(4),.combined-table td:nth-child(4) {{ width:92px; text-align:right; }}
-.combined-total {{ font-size:13px; }}
-.today-value {{ font-weight:850; }}
-.today-positive {{ color:#8ee2b8; }}
-.today-zero {{ color:#ff7b7b; }}
-.combined-bar-row {{ grid-template-columns:minmax(110px,180px) 1fr 92px; }}
-.combined-bar-count {{ display:flex; justify-content:flex-end; gap:8px; align-items:baseline; }}
-.combined-bar-count b {{ color:#dce6fb; }}
-.today-inline {{ font-size:9px; }}
-.quality-fill {{ background:linear-gradient(90deg,var(--orange),#ffe1a8); }}
-.quality-table th:nth-child(1),.quality-table td:nth-child(1) {{ width:66px; }}
-.quality-table th:nth-child(3),.quality-table td:nth-child(3),
-.quality-table th:nth-child(4),.quality-table td:nth-child(4),
-.quality-table th:nth-child(5),.quality-table td:nth-child(5) {{ width:88px; text-align:right; }}
-.quality-rate {{ color:#ffe0a4; font-weight:850; }}
-.compact-audit {{ margin-top:18px; padding:20px 22px; }}
-.audit-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:12px; }}
-.audit-heading h2 {{ margin:0; font-size:17px; }}
-.audit-heading p {{ margin:4px 0 0; font-size:11px; line-height:1.5; }}
-.audit-summary {{ display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }}
-.audit-summary span {{ padding:6px 9px; border:1px solid #4b3d62; border-radius:999px; background:rgba(187,145,255,.08); color:#d8c2ff; font-size:10px; white-space:nowrap; }}
-.audit-person {{ border-top:1px solid var(--line); }}
-.audit-person:first-of-type {{ border-top:0; }}
-.audit-person summary {{ cursor:pointer; list-style:none; display:flex; justify-content:space-between; gap:14px; align-items:center; padding:12px 2px; }}
-.audit-person summary::-webkit-details-marker {{ display:none; }}
-.audit-name {{ font-size:12px; font-weight:800; }}
-.audit-count {{ color:#cdb8f2; font-size:10px; }}
-.audit-table-wrap {{ overflow-x:auto; padding:2px 0 12px; }}
-.audit-table {{ table-layout:fixed; min-width:620px; }}
-.audit-table th,.audit-table td {{ padding:9px 10px; }}
-.audit-table th {{ font-size:9px; }}
-.audit-table td {{ font-size:11px; }}
-.audit-table th:nth-child(1),.audit-table td:nth-child(1) {{ width:58px; }}
-.audit-table th:nth-child(2),.audit-table td:nth-child(2) {{ width:64px; }}
-.audit-table th:nth-child(4),.audit-table td:nth-child(4) {{ width:140px; }}
-.audit-row,.audit-ca,.audit-band {{ white-space:nowrap; font-weight:700; }}
-.audit-action {{ white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }}
-.audit-clear {{ padding:11px 13px; border:1px dashed rgba(103,216,159,.28); border-radius:10px; color:#9be9bf; font-size:11px; }}
-.proposal-details {{ margin-top:18px; padding:18px 20px; }}
-.proposal-details-heading {{ display:flex; justify-content:space-between; align-items:flex-start; gap:18px; margin-bottom:12px; }}
-.proposal-details-heading h2 {{ margin:0; font-size:16px; }}
-.proposal-details-heading p {{ margin:4px 0 0; font-size:10px; line-height:1.5; max-width:900px; }}
-.proposal-details-summary {{ display:flex; gap:7px; flex-wrap:wrap; justify-content:flex-end; }}
-.proposal-details-summary span {{ padding:5px 8px; border:1px solid #3c5f54; border-radius:999px; background:rgba(103,216,159,.07); color:#aee8cb; font-size:9px; white-space:nowrap; }}
-.proposal-table-wrap {{ overflow-x:auto; border:1px solid var(--line); border-radius:12px; }}
-.proposal-detail-table {{ min-width:850px; table-layout:auto; }}
-.proposal-detail-table th,.proposal-detail-table td {{ padding:9px 10px; }}
-.proposal-detail-table .numeric {{ text-align:left; }}
-.proposal-detail-table th {{ font-size:8px; }}
-.proposal-detail-table td {{ font-size:10px; }}
-.proposal-name {{ min-width:150px; font-weight:800; }}
-.proposal-clips {{ min-width:150px; color:#cbd7ef; }}
-.proposal-incomplete,.proposal-incomplete-ranges {{ color:#ffb5b5; font-weight:800; }}
-.proposal-clear {{ padding:11px 13px; border:1px dashed var(--line); border-radius:10px; color:var(--muted); font-size:10px; }}
-.rank-cell {{ white-space:nowrap; }}
-.rank-number {{ display:inline-block; min-width:22px; font-weight:900; font-variant-numeric:tabular-nums; }}
-.medal {{ display:inline-block; width:22px; }}
-.person-name {{ font-weight:750; }}
-.numeric {{ text-align:right; font-variant-numeric:tabular-nums; font-weight:750; }}
-.empty {{ border:1px dashed var(--line); border-radius:13px; color:var(--muted); padding:18px; font-size:12px; }}
-.method {{ margin-top:18px; }}
-.method-grid {{ display:grid; grid-template-columns:repeat(4,1fr); gap:12px; margin-top:14px; }}
-.method-item {{ padding:14px; border-radius:14px; background:#0d1422; border:1px solid var(--line); }}
-.method-item b {{ display:block; margin-bottom:5px; font-size:11px; }}
-.method-item span {{ color:var(--muted); font-size:10px; line-height:1.55; }}
-footer {{ margin-top:24px; text-align:center; color:#70809f; font-size:10px; }}
-@media (max-width:1120px) {{
-  .metrics {{ grid-template-columns:repeat(3,1fr); }}
-  .method-grid {{ grid-template-columns:repeat(2,1fr); }}
-}}
-@media (max-width:820px) {{
-  .dashboard-grid {{ grid-template-columns:1fr; }}
-  .momentum {{ grid-template-columns:repeat(2,1fr); }}
-}}
-@media (max-width:620px) {{
-  .container {{ padding:14px 10px 36px; }}
-  .hero,.panel {{ padding:16px; border-radius:17px; }}
-  .metrics {{ grid-template-columns:1fr 1fr; }}
-  .metric-card:last-child {{ grid-column:1 / -1; }}
-  .momentum {{ grid-template-columns:1fr 1fr; }}
-  .method-grid {{ grid-template-columns:1fr; }}
-  .bar-row {{ grid-template-columns:95px 1fr 46px; gap:7px; }}
-  .combined-bar-row {{ grid-template-columns:95px 1fr 72px; }}
-  .combined-table th:nth-child(1),.combined-table td:nth-child(1) {{ width:55px; }}
-  .combined-table th:nth-child(3),.combined-table td:nth-child(3),
-  .combined-table th:nth-child(4),.combined-table td:nth-child(4) {{ width:64px; }}
-  .quality-table {{ table-layout:auto; }}
-  .quality-table th:nth-child(n),.quality-table td:nth-child(n) {{ width:auto; }}
-  .audit-heading {{ flex-direction:column; }}
-  .audit-summary {{ justify-content:flex-start; }}
-  .proposal-details-heading {{ flex-direction:column; }}
-  .proposal-details-summary {{ justify-content:flex-start; }}
-  .target-table {{ table-layout:auto; }}
-  .target-table th:nth-child(n),.target-table td:nth-child(n) {{ width:auto; }}
-}}
-@media print {{
-  body {{ background:white; color:#111; }}
-  .hero,.panel,.metric-card,.mini-leader {{ background:white; color:#111; box-shadow:none; }}
-  .hero-meta,.panel p,.metric-label,.metric-sub,.mini-leader span,.method-item span {{ color:#555; }}
-  .dashboard-grid {{ grid-template-columns:1fr 1fr; }}
-}}
-</style>
-</head>
-<body>
-<div class="container">
-  <section class="hero">
-    <div class="eyebrow">Temporal NoRA · contribution board</div>
-    <h1>Team Annotation Progress</h1>
-    <div class="hero-meta">
-      <span class="mode-pill"><b>Last Updated:</b> {esc(generated_at_nsw.strftime("%d %B %Y, %I:%M %p %Z").lstrip("0"))}</span>
-      <span class="mode-pill"><b>Target Clips:</b> {fmt_int(target_clips)}</span>
-    </div>
-  </section>
-
-  <section class="metrics">{cards_html}</section>
-
-  <section class="snapshot">
-    <div class="panel">
-      <h2>Current leaders</h2>
-      <p>A quick snapshot before the full rankings below.</p>
-      <div class="momentum">
-        {mini_leader("Annotations", annotation_top)}
-        {full_mini}
-        {mini_leader("Annotated today", today_top)}
-        {mini_leader("Proposals", proposal_top)}
-      </div>
-    </div>
-  </section>
-
-  <main class="dashboard-grid">
-    {annotation_activity_card}
-    {proposal_activity_card}
-    {full_clip_card}
-    {completion_quality_card}
-  </main>
-
-  {compact_audit}
-
-  {proposal_details_html}
-
-  <section class="panel method">
-    <h2>How progress is counted</h2>
-    <p>The daily metric is derived from the earliest saved progress JSON snapshot for the current NSW local date because the annotation objects in the export do not contain reliable per-action timestamps.</p>
-    <div class="method-grid">
-      <div class="method-item">
-        <b>One annotation = one canonical action</b>
-        <span>An action counts once only when it is in that annotator's current action × band matrix and all five time bands are complete. Raw proposal-only actions do not count. In each band, yes requires a non-unset reason_judgment; no requires at least one rejection reason.</span>
-      </div>
-      <div class="method-item">
-        <b>Fully annotated clip</b>
-        <span>Every action in that person's current action × band matrix must be complete for H10, H60, H30M, H1H, and H3H. The matrix is the intersection of the current canonical_action_pool and that annotator's canonical_actions. For yes, reason_judgment must be set; for no, rejection_reasons must be non-empty.</span>
-      </div>
-      <div class="method-item">
-        <b>Today's annotations</b>
-        <span>Current cumulative annotation count minus the earliest saved progress JSON snapshot for today's NSW local date, per person. Negative differences are clamped to zero.</span>
-      </div>
-      <div class="method-item">
-        <b>Human leaderboards only</b>
-        <span>Known model annotators and common model-name patterns are excluded. Explicit exclusions: annotators {esc(", ".join(stats.get("excluded_annotators", [])) or "none")}; clips {esc(", ".join(stats.get("excluded_clip_ids", [])) or "none")}. Detected model names: {esc(ai_names)}.</span>
-      </div>
-    </div>
-  </section>
-
-  <footer>Powered by kiwirafe: kiwirafe.github.io</footer>
-</div>
-</body>
-</html>'''
-
-
-def print_ranking(title: str, rows: list[dict[str, Any]], limit: int = 10) -> None:
-    print(f"\n{title}")
-    if not rows:
-        print("  No activity")
-        return
-    for row in rows[:limit]:
-        print(f"  {row['rank']:>2}. {row['name']:<28} {row['count']:>6,}")
+:root{{--bg:#090d18;--panel:#111827;--text:#f4f7ff;--muted:#9aa8c5;--line:#28344e;--green:#67d89f;--red:#ff7f8c;--orange:#ffbd73;--purple:#bb91ff}}
+*{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;min-height:100vh;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -5%,rgba(83,119,255,.22),transparent 34rem),radial-gradient(circle at 92% 12%,rgba(255,127,140,.10),transparent 30rem),var(--bg)}}
+.container{{max-width:1560px;margin:0 auto;padding:30px 24px 64px}}.hero{{border:1px solid var(--line);border-radius:26px;padding:30px;background:linear-gradient(135deg,rgba(30,46,80,.98),rgba(16,24,41,.98));box-shadow:0 24px 70px rgba(0,0,0,.28)}}
+.eyebrow{{color:#b8c8eb;text-transform:uppercase;letter-spacing:.16em;font-size:11px;font-weight:800}}h1{{margin:8px 0 10px;font-size:clamp(32px,5vw,54px);letter-spacing:-.045em}}.hero-meta{{display:flex;flex-wrap:wrap;gap:8px 18px;margin-top:20px;color:#8fa2c7;font-size:12px}}.hero-meta b{{color:#dce6fb}}
+.panel{{margin-top:18px;border:1px solid var(--line);border-radius:21px;padding:20px;background:rgba(17,24,39,.95);box-shadow:0 14px 34px rgba(0,0,0,.16)}}.panel h2{{margin:0;font-size:20px}}.panel p{{margin:6px 0 14px;color:var(--muted);line-height:1.58;font-size:11px}}.section-one{{border-top:3px solid var(--orange)}}.section-two{{border-top:3px solid var(--purple)}}
+.summary-line{{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 16px}}.summary-pill{{border:1px solid var(--line);border-radius:999px;background:#0d1422;color:#cbd8f1;padding:6px 10px;font-size:10px}}.table-wrap{{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:14px}}.audit-table{{width:100%;border-collapse:collapse;table-layout:auto;min-width:760px}}.audit-table th,.audit-table td{{padding:10px 11px;border-bottom:1px solid var(--line);text-align:left;vertical-align:top;overflow-wrap:anywhere}}.audit-table th{{position:sticky;top:0;z-index:1;color:#95a8cc;background:#151e31;text-transform:uppercase;letter-spacing:.055em;font-size:9px}}.audit-table td{{color:#dce6fb;font-size:11px;line-height:1.45}}.audit-table tbody tr:last-child td{{border-bottom:0}}.audit-table tbody tr:hover td{{background:#141d30}}.disagreement-table{{min-width:1320px}}.disagreement-table th:first-child{{min-width:56px;white-space:nowrap}}.disagreement-table .annotators,.disagreement-table .proposers,.disagreement-table .eligible-reviewers{{min-width:160px;max-width:250px}}
+.audit-table tr[hidden],.filter-empty[hidden]{{display:none}}.filter-toolbar{{display:flex;align-items:center;flex-wrap:wrap;gap:10px 14px;margin:14px 0 16px;padding:12px 14px;border:1px solid var(--line);border-radius:12px;background:#0d1422}}.filter-toolbar label{{font-size:11px;font-weight:800;color:#dbe6fa}}.filter-toolbar select{{min-width:230px;max-width:100%;border:1px solid #425573;border-radius:9px;background:#1b2840;color:#f4f7ff;padding:8px 12px;font-size:12px;cursor:pointer}}.filter-toolbar select:focus-visible{{outline:2px solid #77afff;outline-offset:2px}}.filter-status{{font-size:11px;color:var(--muted);margin-left:auto}}.filter-empty{{margin-top:12px;padding:13px 15px;border:1px dashed var(--line);border-radius:12px;font-size:11px;color:#cbd8f1}}.num,.ca,.band,.person{{white-space:nowrap;font-weight:800}}.num{{text-align:right;font-variant-numeric:tabular-nums}}.action{{min-width:300px;max-width:520px}}.band-line{{white-space:nowrap;margin:1px 0}}.vote-line{{display:flex;align-items:center;gap:5px;flex-wrap:wrap;margin:3px 0}}.subband{{display:inline-block;min-width:112px;color:#9fb0cf;font-size:9px;font-weight:800}}
+.badge{{display:inline-block;margin:1px 4px 1px 0;padding:4px 8px;border-radius:999px;border:1px solid var(--line);background:#0d1422;color:#dce6fb;font-size:9px;font-weight:800}}.badge.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.08)}}.badge.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.08)}}.badge.direct{{color:#b8d1ff;border-color:#425f8e;background:rgba(120,167,255,.09)}}.badge.duplicate{{color:#dfcaff;border-color:#59477a;background:rgba(187,145,255,.09)}}.badge.proposer{{color:#c6b8fc;border-color:#514775;background:rgba(187,145,255,.08)}}.badge.eligible{{color:#a5e6ca;border-color:#326251;background:rgba(103,216,159,.07)}}.none-eligible{{color:#8695ae;font-style:italic}}.judgment{{display:inline-block;margin:2px 4px 2px 0;padding:4px 7px;border-radius:8px;border:1px solid var(--line);font-size:9px;white-space:nowrap}}.judgment.yes{{color:#aee8cb;border-color:#356653;background:rgba(103,216,159,.07)}}.judgment.no{{color:#ffb5bc;border-color:#70404a;background:rgba(255,127,140,.07)}}
+.review-progress{{border-top:3px solid #78a7ff}}.progress-heading{{display:flex;justify-content:space-between;align-items:center;gap:14px;flex-wrap:wrap}}.progress-target{{color:#d9e6ff;border:1px solid #405778;background:#182742;padding:6px 10px;border-radius:999px;font-size:11px;font-weight:800}}.progress-bars{{margin:18px 0 4px}}.progress-bar-row{{display:grid;grid-template-columns:minmax(145px,240px) minmax(100px,1fr) 108px;align-items:center;gap:14px;margin:14px 0}}.progress-person{{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:700;color:#e1eafa}}.progress-track{{height:13px;border-radius:999px;overflow:hidden;background:#202b42}}.progress-fill{{height:100%;border-radius:999px;background:linear-gradient(90deg,#78a7ff,#62d6d2)}}.progress-count{{text-align:right;white-space:nowrap;color:#9eafcd;font-size:12px;font-variant-numeric:tabular-nums}}.progress-count b{{color:#e1eafa;font-size:14px}}.clear-box{{padding:13px 15px;border:1px dashed rgba(103,216,159,.34);border-radius:12px;color:#9be9bf;background:rgba(103,216,159,.035);font-size:11px}}.method-grid{{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:12px;margin-top:14px}}.method-item{{padding:14px;border-radius:14px;background:#0d1422;border:1px solid var(--line)}}.method-item b{{display:block;margin-bottom:5px;font-size:11px}}.method-item span{{color:var(--muted);font-size:10px;line-height:1.55}}code{{background:#0a1120;border:1px solid var(--line);border-radius:6px;padding:2px 5px}}footer{{margin-top:24px;text-align:center;color:#70809f;font-size:10px}}
+@media(max-width:1120px){{.method-grid{{grid-template-columns:1fr}}}}@media(max-width:700px){{.container{{padding:14px 10px 36px}}.hero,.panel{{padding:16px;border-radius:17px}}.progress-bar-row{{grid-template-columns:minmax(100px,145px) minmax(70px,1fr) 79px;gap:7px}}.progress-person{{font-size:10px}}.progress-count{{font-size:10px}}.progress-count b{{font-size:11px}}}}
+</style></head><body><div class="container">
+<section class="hero"><div class="eyebrow">Temporal NoRA · annotation audit</div><h1>Annotation Conflict Audit</h1><div class="hero-meta"><span><b>Generated:</b> {esc(generated.strftime("%d %B %Y, %I:%M %p %Z").lstrip("0"))}</span></div></section>
+{render_review_progress_chart(review_progress)}
+<section class="panel section-one"><h2>2 Yes + 1 No disagreements</h2>{render_two_yes_one_no_table(two_one)}</section>
+<section class="panel section-two"><h2>Annotator rated their own proposed action</h2><p>A finding requires at least one valid Yes/No judgment by the same included human who proposed the action. The table also lists everyone who supplied at least one valid Yes/No judgment on that action. Confirmed duplicate groups are expanded so a proposal remains attributable to its original proposer even when another proposal is selected as the representative canonical action.</p><div class="summary-line"><span class="summary-pill"><b>{fmt_int(self_audit["events"])}</b> self-annotation events</span><span class="summary-pill"><b>{fmt_int(self_audit["affected_actions"])}</b> affected canonical actions</span><span class="summary-pill"><b>{fmt_int(len(self_audit["people"]))}</b> people</span><span class="summary-pill"><b>People:</b> {esc(people)}</span></div>{render_self_annotation_table(self_audit)}</section>
+<section class="panel"><h2>Method & filters</h2><div class="method-grid"><div class="method-item"><b>Human-only audit</b><span>Known/common model names are excluded. Explicit model names: {esc(", ".join(sorted(explicit_ai_names, key=str.casefold)) or "none")}.</span></div><div class="method-item"><b>Default exclusions</b><span>{esc(exclusions)}. Use <code>--include-default-exclusions</code> to disable the built-in Ning/API-Test exclusions.</span></div><div class="method-item"><b>Proposal provenance & reviewer roster</b><span>Canonical <code>proposal_ids</code> are expanded only through <code>confirmed</code> duplicate groups. The six reviewers are listed in <code>DEFAULT_REVIEWERS</code>; use <code>--reviewer NAME</code> (repeatable) to override the roster.</span></div></div></section>
+<footer>Generated by annotation_conflict_audit.py · self-contained HTML</footer></div>{REVIEWER_FILTER_SCRIPT}</body></html>'''
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Generate the current HTML dashboard plus compact progress JSON history."
+        description="Audit 2-Yes/1-No disagreements and annotator/proposer overlap, then generate HTML."
     )
-    parser.add_argument(
-        "--url",
-        default=DEFAULT_URL,
-        help=f"Annotation site URL (default: {DEFAULT_URL})",
-    )
-    parser.add_argument(
-        "--annotator",
-        default=DEFAULT_ANNOTATOR,
-        help=f"Name used to log in (default: {DEFAULT_ANNOTATOR})",
-    )
-    parser.add_argument(
-        "--input",
-        type=Path,
-        help="Use an existing JSON/JSONL export instead of downloading /api/export.",
-    )
-    parser.add_argument(
-        "--export-path",
-        type=Path,
-        default=DEFAULT_EXPORT,
-        help=f"Downloaded export path (default: {DEFAULT_EXPORT})",
-    )
-    parser.add_argument(
-        "--output",
-        type=Path,
-        default=DEFAULT_OUTPUT,
-        help=f"Current HTML output path, overwritten each run (default: {DEFAULT_OUTPUT})",
-    )
-    parser.add_argument(
-        "--progress-json-dir",
-        type=Path,
-        default=None,
-        help=(
-            "Directory for compact progress JSON history "
-            "(default: <output parent>/progress_json)."
-        ),
-    )
-    parser.add_argument(
-        "--target-clips",
-        type=int,
-        default=DEFAULT_TARGET_CLIPS,
-        help=f"Fully annotated clip target per person (default: {DEFAULT_TARGET_CLIPS}).",
-    )
-    parser.add_argument(
-        "--start-row",
-        type=int,
-        default=0,
-        help="0-based first clip row to analyse (default: 0).",
-    )
-    parser.add_argument(
-        "-n",
-        "--num-rows",
-        type=int,
-        default=None,
-        help="Number of clip rows from --start-row (default: all remaining rows).",
-    )
-    parser.add_argument(
-        "--ai-annotator",
-        action="append",
-        default=[],
-        help="Additional annotator name to classify as AI/model. May be repeated.",
-    )
-    parser.add_argument(
-        "--ignore-incomplete-proposal-clips",
-        default=os.getenv("IGNORE_INCOMPLETE_PROPOSAL_CLIPS", ""),
-        metavar="RANGES",
-        help=(
-            "1-based clip numbers/ranges to treat as completed in Incomplete "
-            "proposal details, e.g. '1-30, 38, 50-70'. Can also be set with "
-            "IGNORE_INCOMPLETE_PROPOSAL_CLIPS."
-        ),
-    )
-    parser.add_argument(
-        "--exclude-clip",
-        action="append",
-        default=[],
-        help=(
-            "Additional clip ID to exclude from all statistics. May be repeated. "
-            "API-Test-Clip190 is excluded by default."
-        ),
-    )
-    parser.add_argument(
-        "--exclude-annotator",
-        action="append",
-        default=[],
-        help=(
-            "Additional annotator to exclude from all statistics. May be repeated. "
-            "Ning and API-Test-Clip190 are excluded by default."
-        ),
-    )
+    parser.add_argument("--url", default=DEFAULT_URL, help=f"Annotation site URL (default: {DEFAULT_URL})")
+    parser.add_argument("--annotator", default=DEFAULT_ANNOTATOR, help=f"Name used to log in (default: {DEFAULT_ANNOTATOR})")
+    parser.add_argument("--input", type=Path, help="Use an existing JSON/JSONL export instead of downloading /api/export.")
+    parser.add_argument("--export-path", type=Path, default=DEFAULT_EXPORT, help=f"Downloaded export path (default: {DEFAULT_EXPORT})")
+    parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT, help=f"HTML output path (default: {DEFAULT_OUTPUT})")
+    parser.add_argument("--start-row", type=int, default=0, help="0-based first clip row to analyse (default: 0).")
+    parser.add_argument("-n", "--num-rows", type=int, default=None, help="Number of clip rows from --start-row (default: all remaining rows).")
+    parser.add_argument("--ai-annotator", action="append", default=[], help="Additional annotator name to classify as AI/model. May be repeated.")
+    parser.add_argument("--reviewer", action="append", default=[], help="Replace the default six-person reviewer roster (repeat for each person).")
+    parser.add_argument("--review-target", type=int, default=DEFAULT_REVIEW_TARGET, help=f"Completed adjudication units targeted per person (default: {DEFAULT_REVIEW_TARGET}).")
+    parser.add_argument("--progress-state", type=Path, default=DEFAULT_PROGRESS_STATE,
+                        help=f"Persistent pre-review baseline file (default: {DEFAULT_PROGRESS_STATE}). Keep it between scheduled runs.")
+    parser.add_argument("--exclude-clip", action="append", default=[], help="Additional clip ID to exclude. May be repeated.")
+    parser.add_argument("--exclude-annotator", action="append", default=[], help="Additional annotator name to exclude. May be repeated.")
+    parser.add_argument("--include-default-exclusions", action="store_true", help="Do not automatically exclude Ning or API-Test-Clip190. AI/model exclusions still apply.")
     return parser.parse_args()
 
 
 def main() -> int:
     load_project_env()
     args = parse_args()
-
     if args.start_row < 0:
         raise ValueError("--start-row must be >= 0")
     if args.num_rows is not None and args.num_rows <= 0:
         raise ValueError("-n/--num-rows must be > 0")
-    if args.target_clips <= 0:
-        raise ValueError("--target-clips must be > 0")
-
-    ignored_incomplete_proposal_clips = parse_number_ranges(
-        args.ignore_incomplete_proposal_clips
-    )
+    if args.review_target <= 0:
+        raise ValueError("--review-target must be > 0")
 
     if args.input is not None:
-        export_path = args.input
+        export_path: Path = args.input
         if not export_path.exists():
             raise FileNotFoundError(export_path)
     else:
         export_path = download_export(args)
 
-    records = load_export_records(export_path)
-    total_records = len(records)
+    all_records = load_export_records(export_path)
+    total_records = len(all_records)
     if args.start_row > total_records:
-        raise ValueError(
-            f"--start-row {args.start_row} is beyond the export ({total_records} records)"
-        )
+        raise ValueError(f"--start-row {args.start_row} is beyond the export ({total_records} records)")
+    end_row = total_records if args.num_rows is None else min(total_records, args.start_row + args.num_rows)
+    records = all_records[args.start_row:end_row]
 
-    end_row = (
-        total_records
-        if args.num_rows is None
-        else min(total_records, args.start_row + args.num_rows)
+    ai_names = set(KNOWN_AI_ANNOTATORS)
+    ai_names.update(args.ai_annotator)
+    excluded_clip_ids: set[str] = set()
+    excluded_annotators: set[str] = set()
+    if not args.include_default_exclusions:
+        excluded_clip_ids.update(DEFAULT_EXCLUDED_CLIP_IDS)
+        excluded_annotators.update(DEFAULT_EXCLUDED_ANNOTATORS)
+    excluded_clip_ids.update(args.exclude_clip)
+    excluded_annotators.update(args.exclude_annotator)
+
+    reviewers = tuple(dict.fromkeys(name.strip() for name in args.reviewer if name.strip())) if args.reviewer else DEFAULT_REVIEWERS
+    # Names excluded by the audit cannot be counted as eligible reviewers.
+    reviewers = tuple(
+        name for name in reviewers
+        if not is_excluded(name, excluded_annotators)
+        and not is_ai_annotator(name, ai_names)
     )
-    records = records[args.start_row:end_row]
+    if not reviewers:
+        raise ValueError("Reviewer roster is empty after applying exclusions")
 
     print("\n=== ANALYSE ===")
     print(f"Loaded {total_records:,} clip record(s)")
     if records:
-        print(f"Analysing rows {args.start_row}..{end_row - 1} ({len(records):,} record(s))")
+        print(f"Analysing source rows {args.start_row + 1}..{end_row} ({len(records):,} record(s))")
     else:
         print("No records selected")
 
-    ai_names = set(KNOWN_AI_ANNOTATORS)
-    ai_names.update(args.ai_annotator)
-
-    excluded_clip_ids = set(DEFAULT_EXCLUDED_CLIP_IDS)
-    excluded_clip_ids.update(args.exclude_clip)
-    excluded_annotators = set(DEFAULT_EXCLUDED_ANNOTATORS)
-    excluded_annotators.update(args.exclude_annotator)
-
-    stats = analyse(
+    two_one = analyse_two_yes_one_no(
         records,
-        ai_names,
-        excluded_clip_ids,
-        excluded_annotators,
+        start_row=args.start_row,
+        explicit_ai_names=ai_names,
+        excluded_clip_ids=excluded_clip_ids,
+        excluded_annotators=excluded_annotators,
+        reviewers=reviewers,
     )
-    audit = analyse_missing_details(
+    progress_path = args.progress_state
+    review_progress = analyse_review_progress(
+        records,
+        dispute_audit=two_one,
+        progress_path=progress_path,
+        target=args.review_target,
+        explicit_ai_names=ai_names,
+        excluded_clip_ids=excluded_clip_ids,
+        excluded_annotators=excluded_annotators,
+    )
+    self_audit = analyse_self_annotations(
         records,
         start_row=args.start_row,
         explicit_ai_names=ai_names,
         excluded_clip_ids=excluded_clip_ids,
         excluded_annotators=excluded_annotators,
     )
-    proposal_details = analyse_proposal_details(
-        records,
-        start_row=args.start_row,
-        explicit_ai_names=ai_names,
+
+    report = render_dashboard(
+        two_one,
+        self_audit,
+        review_progress,
         excluded_clip_ids=excluded_clip_ids,
         excluded_annotators=excluded_annotators,
-        ignored_incomplete_clip_numbers=ignored_incomplete_proposal_clips,
+        explicit_ai_names=ai_names,
     )
 
-    now_nsw = dt.datetime.now(NSW_TZ)
     output_path: Path = args.output
-    progress_json_dir = args.progress_json_dir or (output_path.parent / "progress_json")
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_suffix(output_path.suffix + ".tmp")
+    temp_path.write_text(report, encoding="utf-8")
+    temp_path.replace(output_path)
 
-    # Persist this run's compact progress counters first. The timestamp belongs in
-    # the filename so the JSON body contains only the requested per-person metrics.
-    progress_payload = make_progress_json_payload(stats)
-    progress_path = progress_json_snapshot_path(progress_json_dir, now_nsw)
-    progress_created = False
-    if not progress_path.exists():
-        write_json_atomic(progress_path, progress_payload)
-        progress_created = True
-    else:
-        print(f"Progress JSON already exists; keeping immutable snapshot: {progress_path}")
-
-    baseline_result = find_day_baseline(progress_json_dir, now_nsw.date())
-    if baseline_result is None:
-        # This should only be reachable if the just-written JSON was unreadable.
-        raise RuntimeError(f"Could not load a progress JSON baseline from {progress_path.parent}")
-    baseline_path, baseline_payload = baseline_result
-    baseline_counts = counts_from_progress_json(baseline_payload, "actions_annotated")
-    baseline_proposal_counts = counts_from_progress_json(baseline_payload, "proposals")
-
-    human_names = set(stats["human_names"])
-
-    today_counts = make_today_counts(
-        stats["annotation_counts"],
-        baseline_counts,
-        human_names,
-    )
-    today_ranking = rank_counts(today_counts, include_zero_names=human_names)
-
-    proposals_today_counts = make_today_counts(
-        stats["proposal_counts"],
-        baseline_proposal_counts,
-        human_names,
-    )
-    proposals_today_ranking = rank_counts(
-        proposals_today_counts,
-        include_zero_names=human_names,
-    )
-
-    current_html = render_dashboard(
-        stats,
-        today_ranking,
-        proposals_today_ranking,
-        audit,
-        proposal_details,
-        target_clips=args.target_clips,
-        generated_at_nsw=now_nsw,
-    )
-    write_text_atomic(output_path, current_html)
-
-    s = stats["summary"]
-    target_reached = sum(
-        1 for row in stats["full_clip_ranking"] if int(row["count"]) >= args.target_clips
-    )
-    total_today = sum(today_counts.values())
-
-    print(f"Excluded clips: {', '.join(sorted(excluded_clip_ids)) or 'none'}")
-    print(f"Excluded annotators: {', '.join(sorted(excluded_annotators)) or 'none'}")
-    print(
-        "Ignored incomplete proposal clips: "
-        f"{compress_number_ranges(sorted(ignored_incomplete_proposal_clips)) or 'none'}"
-    )
-    print(f"Human contributors: {s['human_contributors']:,}")
-    print(f"Canonical-action annotations: {s['total_annotations']:,}")
-    print(f"Actions annotated today: {total_today:,}")
-    print(f"Full clip completions: {s['full_clip_completions']:,}")
-    print(f"People at target ({args.target_clips} clips): {target_reached:,}")
-    print(f"Human proposals: {s['total_proposals']:,}")
-    print(
-        f"Missing-detail findings: {audit['total_findings']:,} "
-        f"across {audit['people_affected']:,} people"
-    )
-    print(
-        f"Incomplete proposal clips: {proposal_details['incomplete_clips']:,} "
-        f"across {proposal_details['proposers']:,} proposers"
-    )
-
-    print_ranking("Most annotations", stats["annotation_ranking"])
-    print_ranking("Most fully annotated clips", stats["full_clip_ranking"])
-    print_ranking("Actions annotated today", today_ranking)
-    print_ranking("Most actions proposed", stats["proposal_ranking"])
-    print_ranking("Actions proposed today", proposals_today_ranking)
-
+    print(f"Completed independent adjudications:     {sum(review_progress['counts'].values()):,}")
+    print(f"Per-person review target:                {args.review_target:,} units")
+    for person in reviewers:
+        print(f"  {person}: {review_progress['counts'][person]:,}/{args.review_target:,}")
+    if review_progress["ambiguous_units"]:
+        print(f"Ambiguous 5+ voter units (not attributed): {review_progress['ambiguous_units']:,}")
+    print(f"Strict 2 Yes + 1 No units:               {two_one['units']:,}")
+    print(f"Canonical actions affected by 2/1 split: {two_one['affected_actions']:,}")
+    print(f"Self-annotation events:                  {self_audit['events']:,}")
+    print(f"People with self-annotation overlap:     {len(self_audit['people']):,}")
+    if self_audit["people"]:
+        print(f"  {', '.join(self_audit['people'])}")
     print("\n=== REPORT ===")
-    print(f"Current HTML:   {output_path}")
-    print(f"Progress JSON:  {progress_path}{' (created)' if progress_created else ' (existing)'}")
-    print(f"Today's baseline: {baseline_path}")
-    print(f"NSW local date: {now_nsw.date().isoformat()} ({now_nsw.tzname()})")
+    print(f"HTML: {output_path}")
+    print(f"Review progress state: {progress_path}")
     return 0
 
 
