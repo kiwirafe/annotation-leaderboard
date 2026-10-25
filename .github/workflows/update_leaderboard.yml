@@ -1,20 +1,24 @@
-name: Update Annotation Leaderboard
+name: Update Annotation Conflict Audit
 
 on:
   workflow_dispatch:
+  schedule:
+    # Every 10 minutes (UTC), offset from the top of the hour to reduce delay.
+    - cron: '7-57/10 * * * *'
 
 permissions:
   contents: write
   pages: write
   id-token: write
 
+# One audit worker only. Serialize runs so review progress is not lost.
 concurrency:
-  group: annotation-leaderboard
-  cancel-in-progress: true
+  group: annotation-conflict-audit
+  cancel-in-progress: false
 
 env:
   REVIEW_TARGET_UNITS: '700'
-  REVIEW_STATE: review_state/annotation_review_progress.json
+  REVIEW_STATE: docs/review_state/annotation_review_progress.json
 
 jobs:
   update-and-deploy:
@@ -38,18 +42,34 @@ jobs:
           ANNOTATION_ADMIN_PASSWORD: ${{ secrets.ANNOTATION_ADMIN_PASSWORD }}
         run: |
           set -euo pipefail
-          mkdir -p docs review_state
+          mkdir -p docs/review_state
 
-          # Never silently reset historical progress if its committed file vanished.
+          # Migrate an existing ledger without resetting historical adjudications.
+          LEGACY_STATE="review_state/annotation_review_progress.json"
+          if [[ -f "$LEGACY_STATE" ]]; then
+            if [[ ! -f "$REVIEW_STATE" ]]; then
+              mv -- "$LEGACY_STATE" "$REVIEW_STATE"
+              echo "Migrated existing ledger to $REVIEW_STATE"
+            elif cmp -s "$LEGACY_STATE" "$REVIEW_STATE"; then
+              rm -- "$LEGACY_STATE"
+              echo "Removed identical legacy state file."
+            else
+              echo "Both legacy and new progress files exist with different data. Resolve manually to avoid losing reviews." >&2
+              exit 1
+            fi
+          fi
+
+          # Never silently reset previously committed review progress.
           if [[ ! -f "$REVIEW_STATE" ]] && \
-             [[ -n "$(git log -1 --format=%H -- "$REVIEW_STATE")" ]]; then
-            echo "Review progress was previously committed but is now missing. Refusing to reset it." >&2
+             { [[ -n "$(git log -1 --format=%H -- "$REVIEW_STATE")" ]] || \
+               [[ -n "$(git log -1 --format=%H -- "$LEGACY_STATE")" ]]; }; then
+            echo "Review progress was committed before, but is now missing. Refusing to reset." >&2
             exit 1
           fi
 
           # Keep the raw export in the runner's temporary directory, not the repo.
           umask 077
-          python3 update_leaderboard.py \
+          python3 annotation_conflict_audit.py \
             --export-path "$RUNNER_TEMP/annotation_export.jsonl" \
             --output docs/index.html \
             --progress-state "$REVIEW_STATE" \
@@ -64,8 +84,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          # Commit only the review ledger; never commit raw exports or secrets.
+          # Commit only the review ledger and removal of its old location.
+          # Never commit raw exports or secrets.
           git add -- "$REVIEW_STATE"
+          LEGACY_STATE="review_state/annotation_review_progress.json"
+          if git ls-files --error-unmatch "$LEGACY_STATE" >/dev/null 2>&1; then
+            git add -u -- "$LEGACY_STATE"
+          fi
           if git diff --cached --quiet; then
             echo "No change to adjudication progress."
           else
