@@ -17,7 +17,6 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  REVIEW_TARGET_UNITS: '700'
   REVIEW_STATE: docs/review_state/annotation_review_progress.json
 
 jobs:
@@ -36,7 +35,7 @@ jobs:
           ref: ${{ github.event.repository.default_branch }}
           fetch-depth: 0
 
-      - name: Generate conflict audit and update reviewer progress
+      - name: Assign review tasks and generate progress dashboard
         env:
           ANNOTATION_SITE_PASSWORD: ${{ secrets.ANNOTATION_SITE_PASSWORD }}
           ANNOTATION_ADMIN_PASSWORD: ${{ secrets.ANNOTATION_ADMIN_PASSWORD }}
@@ -73,7 +72,6 @@ jobs:
             --export-path "$RUNNER_TEMP/annotation_export.jsonl" \
             --output docs/index.html \
             --progress-state "$REVIEW_STATE" \
-            --review-target "$REVIEW_TARGET_UNITS"
 
           test -s docs/index.html
           test -s "$REVIEW_STATE"
@@ -94,7 +92,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No change to adjudication progress."
           else
-            git commit -m "chore: save adjudication review progress"
+            git commit -m "chore: save adjudication review assignments"
             git push origin "HEAD:${{ github.event.repository.default_branch }}"
           fi
 
