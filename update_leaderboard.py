@@ -6,18 +6,18 @@ Build and persist a fair action-level review queue for Temporal NoRA.
 Two types of review are merged into one queue:
 - Strict 2 Yes / 1 No disagreements: their disputed time bands need a new
   independent human annotation (fourth reviewer).
-- Self-annotations: all five bands of an action need a *non-proposer* who
-  already supplied an annotation to serve as its independent reviewer.
+- Self-annotations: all five bands need a *new*, independent fourth human
+  reviewer who neither proposed nor originally annotated the action.
 
 An entire canonical action always belongs to one reviewer, never split by band.
 Assignments are balanced by assigned unit count while preferring to keep clips
 together. The assignments and three-voter baseline are persisted in a JSON
 state file, so each GitHub Actions run retains earlier decisions.
 
-For disagreement reviews, completion requires a *new* complete judgment from
-the designated fourth reviewer. For self-annotations, the assigned person's
-existing complete judgments count as review evidence; the export has no
-separate second-pass adjudication flag, so this is not proof of re-review.
+For both review types, completion requires a complete *new* judgment from
+its assigned independent reviewer. Historical annotators never automatically
+receive credit for self-annotation review. Self-review baselines are frozen in
+the saved state because the export does not record review chronology.
 The self-contained HTML has a required reviewer selector and green/red status
 per time band. No third-party packages are needed.
 """
@@ -406,6 +406,13 @@ def load_review_progress(path: Path) -> dict[str, Any]:
         if (not isinstance(key, str) or not isinstance(action, dict)
                 or not isinstance(action.get("eligible_reviewers"), list)):
             raise ValueError(f"Invalid self-review action {key} in {path}")
+        # Older ledgers lack original_annotators. They are upgraded using the
+        # current export before any task can receive fourth-review credit.
+        if "original_annotators" in action and (
+            not isinstance(action["original_annotators"], list)
+            or not all(isinstance(name, str) for name in action["original_annotators"])
+        ):
+            raise ValueError(f"Invalid self-review baseline {key} in {path}")
     for key, assignment in data["assignments"].items():
         if (not isinstance(key, str) or not isinstance(assignment, dict)
                 or not isinstance(assignment.get("reviewer"), str)):
@@ -527,8 +534,8 @@ def discover_tasks(
     """Create stable action-level tasks by merging disagreements and self-audits.
 
     Self-annotation overrides the disagreement route for the same canonical
-    action: five bands, with a reviewer who already annotated and isn't a
-    proposer. No band can be assigned to someone else.
+    action: five bands, with a NEW fourth reviewer who did not participate in
+    the original annotation and is not a proposer. No band can be split.
     """
     changed = False
     tracked = state["tracked_units"]
@@ -564,16 +571,28 @@ def discover_tasks(
             history_by_action[action["key"]][horizon] = tracked[unit_key]
 
         if action["self_annotators"] and action["key"] not in self_actions:
-            # Only someone who *actually annotated* and is not a proposer can
-            # review a self-annotated action. Freeze eligible names for stability.
-            proposers = {name.casefold() for name in action["proposers"]}
-            annotators = {name.casefold() for name in action["annotators"]}
-            eligible = [name for name in reviewers
-                        if name.casefold() in annotators and name.casefold() not in proposers]
+            # Freeze EVERY original annotator, not just the self-annotator.
+            # An independent reviewer must be a distinct fourth human.
+            original = sorted(action["annotators"], key=str.casefold)
+            blocked = {name.casefold() for name in original + action["proposers"]}
             self_actions[action["key"]] = {
-                "eligible_reviewers": eligible,
+                "original_annotators": original,
                 "original_self_annotators": sorted(action["self_annotators"], key=str.casefold),
+                "eligible_reviewers": [r for r in reviewers if r.casefold() not in blocked],
             }
+            changed = True
+
+        # Upgrade ledgers written by the previous implementation, which
+        # incorrectly assigned self-reviews to existing annotators. At upgrade
+        # time we cannot tell from the export whether an annotation is an
+        # actual later review, so freeze all CURRENT annotators as the safe
+        # baseline. This deliberately revokes false completion credit without
+        # overwriting previously tracked 2/1 disagreement votes.
+        if action["key"] in self_actions and "original_annotators" not in self_actions[action["key"]]:
+            old = self_actions[action["key"]]
+            old["original_annotators"] = sorted(action["annotators"], key=str.casefold)
+            blocked = {name.casefold() for name in old["original_annotators"] + action["proposers"]}
+            old["eligible_reviewers"] = [r for r in reviewers if r.casefold() not in blocked]
             changed = True
 
     tasks: list[dict[str, Any]] = []
@@ -585,13 +604,18 @@ def discover_tasks(
         is_self = self_info is not None
         if is_self:
             # Even if the conflict audit found just one disputed band, all five
-            # are part of the self-annotation review.
+            # are part of the self-annotation review. Eligibility is frozen to
+            # original annotators; do NOT exclude a later fourth reviewer just
+            # because their new judgment now appears in the export.
             bands = list(EXPECTED_HORIZONS)
-            candidates = [roster[name.casefold()]
-                          for name in self_info["eligible_reviewers"]
-                          if name.casefold() in roster]
-            current_proposers = {n.casefold() for n in action["proposers"]}
-            candidates = [name for name in candidates if name.casefold() not in current_proposers]
+            original = {name.casefold() for name in self_info["original_annotators"]}
+            current_proposers = {name.casefold() for name in action["proposers"]}
+            candidates = [name for name in reviewers
+                          if name.casefold() not in original
+                          and name.casefold() not in current_proposers]
+            if self_info["eligible_reviewers"] != candidates:
+                self_info["eligible_reviewers"] = candidates
+                changed = True
         else:
             bands = [h for h in EXPECTED_HORIZONS if h in dispute_units]
             # Freeze the original action-wide exclusion sets to avoid treating
@@ -609,6 +633,7 @@ def discover_tasks(
             "type": "self" if is_self else "disagreement",
             "had_disagreement": bool(dispute_units),
             "self_annotators": self_info.get("original_self_annotators", []) if self_info else [],
+            "original_annotators": self_info.get("original_annotators", []) if self_info else [],
             "bands": bands,
             "unit_count": len(bands),
             "eligible_reviewers": candidates,
@@ -759,9 +784,9 @@ def assign_review_tasks(
 def update_review_completion(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     """Compute reviewed per band from actual export evidence, not row order.
 
-    Disagreements: assignee must be an *additional* complete human voter, not
-    one of the frozen original three. Self-annotations: assignee must already
-    have participated, and each complete band is credited independently.
+    Both kinds: assignee must be a new, independent human who supplied a
+    complete judgment. Self-annotations additionally require three other
+    distinct human judgments on each band before declaring a fourth review.
     """
     reviewed = collections.Counter()
     assigned = collections.Counter()
@@ -781,10 +806,19 @@ def update_review_completion(tasks: list[dict[str, Any]]) -> dict[str, Any]:
                                 and original.issubset(now)
                                 and person.casefold() in now)
                 else:
-                    # For self-annotation audit, the trusted non-proposer's
-                    # original complete annotation is the review evidence.
-                    complete = (complete and person.casefold() in
-                                {name.casefold() for name in task["annotators"]})
+                    # Never credit an already-existing annotator as a fourth
+                    # reviewer. The original reviewer baseline survives future
+                    # workflow runs in the committed review-state JSON.
+                    original = {name.casefold() for name in task["original_annotators"]}
+                    current_votes = {name.casefold() for name in
+                                     task["ratings"].get(horizon, {})}
+                    other_votes = current_votes - {person.casefold()}
+                    complete = (complete
+                                and person.casefold() not in original
+                                and person.casefold() not in
+                                {name.casefold() for name in task["proposers"]}
+                                and person.casefold() in current_votes
+                                and len(other_votes) >= 3)
             status[horizon] = bool(complete)
             if person:
                 assigned[person] += 1
@@ -837,9 +871,9 @@ def render_review_progress_chart(
         '<div class="panel-header"><h2>Review progress</h2>'
         f'<span class="caption-pill">{fmt_int(sum(totals["assigned"].values()))} units assigned</span></div>'
         '<p>Completed / assigned time-band units. Each bar’s limit is that person’s own assigned total. '
-        'Disagreements count a new complete fourth annotation; for self-annotations, '
-        'a complete existing annotation by a non-proposer counts as review evidence '
-        '(the export has no separate re-review flag).</p>'
+        'Both disagreements and self-annotations require a new, complete fourth '
+        'human annotation from the assigned independent reviewer; original '
+        'annotations are never counted as reviews.</p>'
         f'<div class="progress-bars">{"".join(bars)}</div></section>'
     )
 
