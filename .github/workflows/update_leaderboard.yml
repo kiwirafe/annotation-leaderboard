@@ -65,7 +65,7 @@ jobs:
 
           # Keep the raw export in the runner's temporary directory, not the repo.
           umask 077
-          python3 annotation_conflict_audit.py \
+          python3 update_leaderboard.py \
             --export-path "$RUNNER_TEMP/annotation_export.jsonl" \
             --output docs/index.html \
             --progress-state "$REVIEW_STATE" \
