@@ -1,10 +1,7 @@
-name: Update Annotation Conflict Audit
+name: Update Annotation Conflict Dashboard
 
 on:
   workflow_dispatch:
-  schedule:
-    # Every 10 minutes (UTC), offset from the top of the hour to reduce delay.
-    - cron: '7-57/10 * * * *'
 
 permissions:
   contents: write
