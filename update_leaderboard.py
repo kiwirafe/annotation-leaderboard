@@ -902,11 +902,11 @@ def render_review_table(tasks: list[dict[str, Any]], reviewers: tuple[str, ...])
             f'<td class="num">{fmt_int(task["row"])}</td>'
             f'<td class="ca">{esc(task["canonical_action_id"])}</td>'
             f'<td class="action">{esc(task["action"])}</td>'
-            f'<td class="category"><span class="type-pill {task["type"]}" '
+            f'<td class="category private-detail" hidden><span class="type-pill {task["type"]}" '
             f'title="{esc(type_label + title_extra)}">{esc(type_label)}</span></td>'
             f'<td class="band">{bands}</td>'
-            f'<td class="annotators">{stacked_badges(task["annotators"])}</td>'
-            f'<td class="proposers">{stacked_badges(task["proposers"], "proposer")}</td>'
+            f'<td class="annotators private-detail" hidden>{stacked_badges(task["annotators"])}</td>'
+            f'<td class="proposers private-detail" hidden>{stacked_badges(task["proposers"], "proposer")}</td>'
             f'<td class="review-status">{statuses}</td></tr>'
         )
     return (
@@ -923,8 +923,8 @@ def render_review_table(tasks: list[dict[str, Any]], reviewers: tuple[str, ...])
         'Please select your name to view your assigned review actions.</div>'
         '<div id="selected-reviewer-work" hidden>'
         '<div class="table-wrap"><table class="audit-table" id="review-table">'
-        '<thead><tr><th>Row</th><th>CA</th><th>Action</th><th>Review type</th>'
-        '<th>Time bands</th><th>Annotated by</th><th>Proposed by</th>'
+        '<thead><tr><th>Row</th><th>CA</th><th>Action</th><th class="private-detail" hidden>Review type</th>'
+        '<th>Time bands</th><th class="private-detail" hidden>Annotated by</th><th class="private-detail" hidden>Proposed by</th>'
         f'<th>Reviewed</th></tr></thead><tbody>{"".join(rows)}</tbody></table></div>'
         '<div id="filter-empty" class="empty-message" hidden>No review actions assigned to this person.</div>'
         '</div></section>'
@@ -963,6 +963,24 @@ FILTER_SCRIPT = r"""<script>
     empty.hidden = !selected || count > 0;
     table.hidden = selected && count === 0;
   }
+  // A subtle triple-click on the Last Updated pill toggles additional audit details.
+  // The columns start hidden on each page load; there is no visible unlock hint.
+  const lastUpdated = document.getElementById('last-updated-trigger');
+  const detailCells = Array.from(table.querySelectorAll('.private-detail'));
+  let clickCount = 0;
+  let lastClickAt = 0;
+  lastUpdated.addEventListener('click', () => {
+    const now = Date.now();
+    clickCount = now - lastClickAt <= 2500 ? clickCount + 1 : 1;
+    lastClickAt = now;
+    if (clickCount !== 3) return;
+    clickCount = 0;
+    const reveal = lastUpdated.getAttribute('aria-expanded') !== 'true';
+    detailCells.forEach(cell => { cell.hidden = !reveal; });
+    table.classList.toggle('details-visible', reveal);
+    lastUpdated.setAttribute('aria-expanded', String(reveal));
+  });
+
   picker.addEventListener('change', apply);
   apply();
 })();
@@ -997,16 +1015,17 @@ def render_dashboard(
 *{{box-sizing:border-box}}html{{scroll-behavior:smooth}}body{{margin:0;min-height:100vh;font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;color:var(--text);background:radial-gradient(circle at 12% -5%,rgba(83,119,255,.22),transparent 34rem),radial-gradient(circle at 92% 12%,rgba(255,127,140,.10),transparent 30rem),var(--bg)}}
 .container{{max-width:1440px;margin:0 auto;padding:30px 24px 60px}}.hero{{border:1px solid var(--line);border-radius:24px;padding:27px 30px;background:linear-gradient(135deg,#1e2e50,#101829)}}h1{{margin:8px 0 15px;font-size:clamp(31px,4vw,48px);letter-spacing:-.045em}}.eyebrow{{color:#b8c8eb;text-transform:uppercase;letter-spacing:.16em;font-size:11px;font-weight:800}}
 .mode-pill{{display:inline-block;padding:5px 10px;border:1px solid #42567e;border-radius:999px;background:#15233b;color:#dbe7ff;font-size:12px;font-weight:700}}
+.mode-pill[type="button"]{{font-family:inherit;cursor:pointer}}.mode-pill[type="button"]:focus-visible{{outline:2px solid var(--blue);outline-offset:3px}}
 .panel{{margin-top:18px;border:1px solid var(--line);border-radius:20px;padding:22px;background:var(--panel)}}.panel h2{{margin:0;font-size:19px}}.panel p{{margin:7px 0 14px;color:var(--muted);line-height:1.55;font-size:12px}}.panel-header{{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}}.caption-pill{{border:1px solid #415578;border-radius:999px;background:#17243b;padding:6px 11px;font-weight:700;font-size:11px;color:#cbdfff}}
 .progress-panel{{border-top:3px solid var(--blue)}}.progress-bars{{margin-top:18px}}.progress-row{{display:grid;grid-template-columns:minmax(145px,230px) minmax(100px,1fr) 100px;align-items:center;gap:15px;margin:14px 0}}.progress-person{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;font-weight:700}}.progress-track{{height:13px;border-radius:99px;background:#253148;overflow:hidden}}.progress-fill{{height:100%;border-radius:99px;background:linear-gradient(90deg,#4dbb93,var(--green))}}.progress-count{{text-align:right;white-space:nowrap;color:#a5b5d0;font-size:12px;font-variant-numeric:tabular-nums}}.progress-count b{{color:#e9f3ff;font-size:14px}}
 .queue-panel{{border-top:3px solid var(--orange)}}.filter-toolbar{{display:flex;align-items:center;flex-wrap:wrap;gap:12px;margin:17px 0;padding:13px 15px;border:1px solid var(--line);border-radius:13px;background:#0d1422}}.filter-toolbar label{{font-size:12px;font-weight:800}}.filter-toolbar select{{min-width:260px;max-width:100%;border:1px solid #526682;border-radius:9px;background:#1b2840;color:#f4f7ff;padding:9px 12px;font-size:12px;cursor:pointer}}.filter-toolbar select:focus-visible{{outline:2px solid var(--blue);outline-offset:2px}}.filter-status{{margin-left:auto;color:#b6c7e2;font-size:11px}}.choice-warning{{border:1px solid #7e6332;background:rgba(255,189,115,.09);border-radius:12px;padding:15px 18px;color:#ffdca7;font-weight:700;font-size:12px}}
-.table-wrap{{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:13px}}.audit-table{{width:100%;min-width:1090px;border-collapse:collapse;table-layout:auto}}.audit-table th,.audit-table td{{padding:10px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left;overflow-wrap:anywhere}}.audit-table th{{background:#151e31;color:#a6b9da;position:sticky;top:0;font-size:10px;letter-spacing:.045em;text-transform:uppercase}}.audit-table td{{color:#e0e9fa;font-size:11px;line-height:1.6}}.audit-table tr:last-child td{{border-bottom:none}}.audit-table tbody tr:hover td{{background:#141e31}}
+.table-wrap{{width:100%;overflow-x:auto;border:1px solid var(--line);border-radius:13px}}.audit-table{{width:100%;min-width:710px;border-collapse:collapse;table-layout:auto}}.audit-table.details-visible{{min-width:1090px}}.audit-table th,.audit-table td{{padding:10px 10px;border-bottom:1px solid var(--line);vertical-align:top;text-align:left;overflow-wrap:anywhere}}.audit-table th{{background:#151e31;color:#a6b9da;position:sticky;top:0;font-size:10px;letter-spacing:.045em;text-transform:uppercase}}.audit-table td{{color:#e0e9fa;font-size:11px;line-height:1.6}}.audit-table tr:last-child td{{border-bottom:none}}.audit-table tbody tr:hover td{{background:#141e31}}
 .num,.ca{{white-space:nowrap;font-weight:800}}.action{{min-width:250px;max-width:430px}}.band{{min-width:142px}}.review-status{{min-width:130px}}.annotators,.proposers{{min-width:120px;max-width:155px}}.band-line{{min-height:25px;display:flex;align-items:center;margin:1px 0}}.status{{border:1px solid transparent;border-radius:7px;padding:2px 6px;display:inline-block;font-weight:850;font-size:10px;white-space:nowrap}}.status.done{{color:#aeedd1;border-color:#376753;background:rgba(103,216,159,.09)}}.status.pending{{color:#ffb4bd;border-color:#70404a;background:rgba(255,127,140,.09)}}
 .stacked-names{{display:flex;flex-direction:column;align-items:flex-start;gap:4px}}.badge{{display:block;margin:0;padding:3px 7px;border-radius:99px;border:1px solid #324057;background:#0e1626;color:#d3dff4;font-size:9px;font-weight:750;max-width:100%}}.badge.proposer{{border-color:#5f4c82;color:#dbc5ff;background:rgba(187,145,255,.07)}}.type-pill{{display:inline-block;white-space:nowrap;padding:4px 7px;border-radius:8px;font-size:10px;font-weight:800;border:1px solid #385679;color:#bcd7ff;background:#18273d}}.type-pill.self{{color:#e7cbff;border-color:#62497f;background:#281e37}}.category{{min-width:111px}}.empty-message{{margin-top:12px;padding:14px 16px;border:1px dashed var(--line);border-radius:10px;color:var(--muted);font-size:12px}}
 .exceptions{{border-top:3px solid var(--red)}}.exceptions li{{font-size:12px;margin:9px 0;color:#f7c0c4}}footer{{margin-top:22px;text-align:center;color:#8190af;font-size:10px}}[hidden],tr[hidden]{{display:none !important}}
 @media(max-width:700px){{.container{{padding:14px 10px 35px}}.hero,.panel{{padding:16px;border-radius:16px}}.progress-row{{grid-template-columns:110px minmax(70px,1fr) 75px;gap:7px}}.progress-person,.progress-count{{font-size:10px}}.progress-count b{{font-size:11px}}.filter-status{{margin-left:0;width:100%}}}}
 </style></head><body><div class="container">
-<section class="hero"><div class="eyebrow">Temporal NoRA · annotation review</div><h1>Annotation Review Assignments</h1><span class="mode-pill"><b>Last Updated:</b> {esc(updated_at_aest.strftime('%d %B %Y, %I:%M %p AEST').lstrip('0'))}</span></section>
+<section class="hero"><div class="eyebrow">Temporal NoRA · annotation review</div><h1>Annotation Review Assignments</h1><button type="button" id="last-updated-trigger" class="mode-pill" aria-expanded="false" aria-controls="review-table"><b>Last Updated:</b> {esc(updated_at_aest.strftime('%d %B %Y, %I:%M %p AEST').lstrip('0'))}</button></section>
 {render_review_progress_chart(tasks,reviewers,totals)}
 {render_review_table(tasks,reviewers)}
 {unassignable_html}
