@@ -1994,7 +1994,7 @@
     },
     "[\"3455a3f3-1657-46bb-ae42-52d16ec5ffaa_6236-63\",\"CA19\"]": {
       "reviewer": "Naman Kansal",
-      "unit_count": 2
+      "unit_count": 5
     },
     "[\"3455a3f3-1657-46bb-ae42-52d16ec5ffaa_6236-63\",\"CA2\"]": {
       "reviewer": "Naman Kansal",
@@ -10717,6 +10717,21 @@
       ],
       "original_self_annotators": [
         "Khai"
+      ]
+    },
+    "[\"3455a3f3-1657-46bb-ae42-52d16ec5ffaa_6236-63\",\"CA19\"]": {
+      "eligible_reviewers": [
+        "Hanyu",
+        "Naman Kansal"
+      ],
+      "original_annotators": [
+        "Jiayang Wang",
+        "Khai",
+        "Ngakan Putu Bagus Aditya",
+        "Shantelle So"
+      ],
+      "original_self_annotators": [
+        "Shantelle So"
       ]
     },
     "[\"3455a3f3-1657-46bb-ae42-52d16ec5ffaa_6236-63\",\"CA5\"]": {
